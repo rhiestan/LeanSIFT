@@ -21,13 +21,13 @@ doubled as in Lowe's paper). VLFeat is single-threaded.
 
 | image | size | features | VLFeat | LeanSift, 1 thread | LeanSift, 16 threads | speed-up |
 |---|---|---|---|---|---|---|
-| box.pgm | 324x223 | 703 | 91 | 10.7 (10.7) | 3.5 (3.2) | 26x |
-| roofs1.jpg | 640x478 | 4601 | 387 | 58.8 (57.4) | 9.7 (9.0) | 40x |
-| graf1.png | 800x640 | 4191 | 399 | 75.5 (73.6) | 18.1 (14.6) | 22x |
-| river1.jpg | 1024x768 | 11511 | 1041 | 162 (159) | 31.1 (25.0) | 34x |
-| 12 MP mosaic | 4000x3000 | 170043 | 14686 | 2428 (2386) | 337 (328) | 44x |
+| box.pgm | 324x223 | 703 | 89 | 10.4 (10.2) | 2.4 (2.2) | 37x |
+| roofs1.jpg | 640x478 | 4601 | 394 | 56.0 (55.0) | 9.0 (7.4) | 44x |
+| graf1.png | 800x640 | 4191 | 393 | 66.3 (65.4) | 8.8 (8.5) | 45x |
+| river1.jpg | 1024x768 | 11511 | 1010 | 149 (147) | 19.7 (18.5) | 51x |
+| 12 MP mosaic | 4000x3000 | 170043 | 14299 | 2222 (2203) | 284 (274) | 50x |
 
-With 32 threads (SMT) the 12 MP image takes 299 (280) ms.
+With 32 threads (SMT) the 12 MP image takes 282 (271) ms.
 
 Agreement with VLFeat on the same images: 99.86 to 99.97 % of VLFeat's keypoints
 have a LeanSift keypoint within 0.05 pixels (of their octave), 0.7 % in scale and

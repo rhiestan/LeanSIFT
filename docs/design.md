@@ -56,8 +56,8 @@ tall enough to give each thread about two tiles. For each tile, the pipeline kee
   the next level's blur and by the detector;
 - ring buffers of DoG rows around the current detection row.
 
-Rows are produced on demand: detecting extrema on row y needs every level up to row
-y + 7 (the detector's 3x3x3 neighbourhood plus the refinement, which can move a
+Rows are produced on demand, two at a time: detecting extrema on row y needs every
+level up to row y + 7 (the detector's 3x3x3 neighbourhood plus the refinement, which can move a
 keypoint by up to four pixels), which pulls the rows each level needs from the level
 below, down to the (optionally doubled) input. The doubling itself is also done row by
 row. While the rows are in cache the pass also
@@ -107,9 +107,12 @@ every x86 and Arm instruction set Highway supports; `HWY_DYNAMIC_DISPATCH` picks
 best at run time. Highlights:
 
 - **Gaussian blur:** separable, using the kernel's symmetry (one multiply per pair of
-  taps), four vectors per step to amortise loads of row pointers and coefficients,
-  and replicated borders written into a padded row so the inner loops have no
-  checks.
+  taps), several vectors per step to amortise loads of row pointers and
+  coefficients, and replicated borders written into a padded row so the inner loops
+  have no checks. The vertical pass computes two output rows at once: with
+  L_j = in[y - j] and R_j = in[y + 1 + j], out[y] = sum k_j (L_j + R_{j-1}) and
+  out[y + 1] = sum k_j (L_{j-1} + R_j), so each input row is loaded once for both,
+  which halves the cache traffic of the pass.
 - **Extrema:** vectors of 8 or 16 pixels are compared against the threshold first,
   then against the 8 neighbours on their level, then the 9 on each adjacent level,
   leaving early when no lane can still be an extremum.
@@ -117,6 +120,15 @@ best at run time. Highlights:
 
 Rows are padded to a multiple of 16 floats with guard space around every buffer, so
 vectors can run past the ends of rows without masking.
+
+### Overlapping octaves
+
+The orientations and descriptors of octave o and the scale space of octave o + 1 do
+not depend on each other, so they run in the same parallel job: the tiles of octave
+o + 1 first (they are the larger items), then chunks of eight keypoints of octave o,
+each computing orientations and then descriptors. The gradients' Gaussian levels are
+double-buffered between even and odd octaves for this. The output is assembled once
+at the end, in parallel.
 
 ### Threads
 
@@ -160,13 +172,23 @@ full-size DoG or intermediate images, working set per tile in the low megabytes)
 dynamic scheduling of keypoints, padding to avoid false sharing, and fine-grained
 tasks for detection (tiles rather than scales).
 
+## Experiments that did not pay off
+
+- Storing gradients (half-float magnitude, 16-bit angle) computed once per pixel in
+  the scale-space pass instead of computing them per window: the descriptors got only
+  slightly faster and the scale space correspondingly slower.
+- Approximate reciprocal and square root in the gradient kernel: no measurable gain.
+- More tiles per thread: no gain; the recomputed margins cost more than the better
+  balance saves.
+- Keeping the descriptor accumulators in a separate, non-inlined function to avoid a
+  register spill: the spill went away but the loop did not get faster.
+
+On this CPU, multi-threaded efficiency is limited by the lower all-core clock and by
+memory traffic (16 threads reach about 8x the single-threaded speed).
+
 ## Possible next steps
 
-- Overlap an octave's orientations and descriptors with the next octave's scale space
-  to fill the gaps between phases (needs double-buffered kept levels).
-- Blur: compute several output rows per pass over the input rows to cut cache traffic
-  in the vertical pass.
-- Store the kept levels in 16-bit fixed point to halve their memory traffic (a small
-  deviation from VLFeat).
+- Descriptors are now the largest cost (about 60 % on one thread, about 22 cycles per
+  sample). A different accumulation scheme would be needed for a large gain.
 - 8-float register accumulation for 128-bit targets (two vectors per cell) for NEON.
 - A GPU backend behind the same API.
