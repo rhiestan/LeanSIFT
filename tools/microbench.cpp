@@ -41,7 +41,20 @@ void BenchBlur(int width, int radius, int rows_out) {
     const auto t1 = Clock::now();
     best = std::min(best, std::chrono::duration<double, std::nano>(t1 - t0).count());
   }
-  std::printf("blur w=%5d r=%2d: %.3f ns/px\n", width, radius, best / (double(width) * rows_out));
+  double best_pair = 1e300;
+  std::vector<const float*> pair_ptrs(2 * radius + 2);
+  for (int rep = 0; rep < 5; ++rep) {
+    const auto t0 = Clock::now();
+    for (int y = 0; y + 1 < rows_out; y += 2) {
+      for (int j = 0; j <= 2 * radius + 1; ++j) pair_ptrs[j] = base + (y + j) * stride;
+      float* o = out.get() + kPlaneGuard;
+      BlurRowPair(pair_ptrs.data(), radius, kernel.data(), width, 0, width, o, o + 2 * stride, scratch.get());
+    }
+    const auto t1 = Clock::now();
+    best_pair = std::min(best_pair, std::chrono::duration<double, std::nano>(t1 - t0).count());
+  }
+  std::printf("blur w=%5d r=%2d: %.3f ns/px, pairs %.3f ns/px\n", width, radius, best / (double(width) * rows_out),
+              best_pair / (double(width) * (rows_out / 2 * 2)));
 }
 
 // Descriptors of random keypoints on a smooth random image.

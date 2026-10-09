@@ -76,6 +76,12 @@ std::size_t BlurRowScratchSize(int columns, int radius);
 void BlurRow(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out,
              float* scratch);
 
+/// Two consecutive output rows of BlurRow at once: `rows` holds the
+/// 2 * radius + 2 input rows from radius rows above the first output row to
+/// radius rows below the second. Each input row is loaded once for both.
+void BlurRowPair(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                 float* out1, float* scratch);
+
 /// Appends the x in [xb, xe) of the strict local extrema in row `cur[1]`
 /// (against its 26 neighbours in the three rows of `prev`, `cur` and `next`,
 /// which are the DoG levels below, at and above) with |value| >= threshold,

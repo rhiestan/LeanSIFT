@@ -194,24 +194,79 @@ void DownsampleRowImpl(const float* in, int w_out, float* out) {
 // Gaussian blur
 // ---------------------------------------------------------------------------
 
+// Floats of one vertical-pass buffer of BlurRow(Pair) for these columns.
+inline std::size_t BlurTmpFloats(int columns, int radius) {
+  return static_cast<std::size_t>(RoundUpTo(columns + 4 * radius + 8 * kPlaneAlign + 2 * kPlaneGuard, kPlaneAlign));
+}
+
+// The vertical-pass buffer for output columns [x0, x1): tmp[x] holds column
+// x, and tmp + x is aligned when x is. Returns the first column to compute.
+HWY_INLINE float* BlurTmp(float* scratch, int r, int x0, int& xa) {
+  xa = std::max(0, x0 - r) / kPlaneAlign * kPlaneAlign;
+  return scratch + RoundUpTo(r + 2 * kPlaneAlign, kPlaneAlign) - xa;
+}
+
+// Horizontal pass of the separable blur: out[x] for x in [x0, x1) from the
+// vertical pass in tmp, which holds the columns [x0 - r, x1 + r) within the
+// image. Replicates the image border into tmp first so that the loops need
+// no checks.
+HWY_INLINE void HorizontalPass(DF d, const float* HWY_RESTRICT kernel, int r, int w, int x0, int x1,
+                               float* HWY_RESTRICT tmp, float* HWY_RESTRICT out) {
+  const int N = static_cast<int>(hn::Lanes(d));
+  const VF k0 = hn::Set(d, kernel[0]);
+  if (x0 - r < 0) {
+    for (int i = 1; i <= r; ++i) tmp[-i] = tmp[0];
+  }
+  if (x1 + r + N > w) {
+    const float right = tmp[w - 1];
+    for (int i = w; i < x1 + r + 2 * N; ++i) tmp[i] = right;
+  }
+
+  // Four vectors at a time, from a vector-aligned start, using the kernel
+  // symmetry to halve the multiplies.
+  int x = x0 / N * N;
+  for (; x + 4 * N <= x1 + N - 1; x += 4 * N) {
+    const float* t = tmp + x;
+    VF a0 = hn::Mul(k0, hn::Load(d, t));
+    VF a1 = hn::Mul(k0, hn::Load(d, t + N));
+    VF a2 = hn::Mul(k0, hn::Load(d, t + 2 * N));
+    VF a3 = hn::Mul(k0, hn::Load(d, t + 3 * N));
+    for (int j = 1; j <= r; ++j) {
+      const VF k = hn::Set(d, kernel[j]);
+      a0 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t - j), hn::LoadU(d, t + j)), a0);
+      a1 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + N - j), hn::LoadU(d, t + N + j)), a1);
+      a2 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + 2 * N - j), hn::LoadU(d, t + 2 * N + j)), a2);
+      a3 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + 3 * N - j), hn::LoadU(d, t + 3 * N + j)), a3);
+    }
+    hn::Store(a0, d, out + x);
+    hn::Store(a1, d, out + x + N);
+    hn::Store(a2, d, out + x + 2 * N);
+    hn::Store(a3, d, out + x + 3 * N);
+  }
+  for (; x < x1; x += N) {
+    VF acc = hn::Mul(k0, hn::Load(d, tmp + x));
+    for (int j = 1; j <= r; ++j) {
+      const VF pair = hn::Add(hn::LoadU(d, tmp + x - j), hn::LoadU(d, tmp + x + j));
+      acc = hn::MulAdd(hn::Set(d, kernel[j]), pair, acc);
+    }
+    hn::Store(acc, d, out + x);
+  }
+}
+
 void BlurRowImpl(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out,
                  float* scratch) {
   const DF d;
   const int N = static_cast<int>(hn::Lanes(d));
   const int r = radius;
-  // tmp[x] holds the vertical pass at column x; tmp + x is aligned when x is.
-  const int xa = std::max(0, x0 - r) / kPlaneAlign * kPlaneAlign;
+  int xa;
+  float* tmp = BlurTmp(scratch, r, x0, xa);
   const int xe = std::min(w, x1 + r + N);
-  float* tmp = scratch + RoundUpTo(r + 2 * kPlaneAlign, kPlaneAlign) - xa;
   const float* center = rows[r];
   const VF k0 = hn::Set(d, kernel[0]);
 
-  // Both passes use the kernel symmetry to halve the multiplies, and work on
-  // four vectors at a time so that the row pointers and kernel values are
-  // loaded once per four vectors. Vectors may compute columns outside the
-  // requested range; those values are not used.
-
-  // Vertical pass over [xa, xe).
+  // Vertical pass over [xa, xe), four vectors at a time so that the row
+  // pointers and kernel values are loaded once per four vectors. Vectors may
+  // compute columns outside the requested range; those are not used.
   int x = xa;
   for (; x + 4 * N <= xe; x += 4 * N) {
     VF a0 = hn::Mul(k0, hn::Load(d, center + x));
@@ -240,44 +295,67 @@ void BlurRowImpl(const float* const* rows, int radius, const float* kernel, int 
     }
     hn::Store(acc, d, tmp + x);
   }
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp, out);
+}
 
-  // Replicate the image border so the horizontal pass needs no checks.
-  if (x0 - r < 0) {
-    for (int i = 1; i <= r; ++i) tmp[-i] = tmp[0];
-  }
-  if (x1 + r + N > w) {
-    const float right = tmp[w - 1];
-    for (int i = w; i < x1 + r + 2 * N; ++i) tmp[i] = right;
-  }
+// Two consecutive output rows y and y + 1; rows[0..2r+1] are the input rows
+// y - r .. y + 1 + r. With L_j = in[y - j] and R_j = in[y + 1 + j]:
+//   out0 = k0 L_0 + sum_j k_j (L_j + R_{j-1})
+//   out1 = k0 R_0 + sum_j k_j (L_{j-1} + R_j)
+// so each input row is loaded once for both outputs.
+void BlurRowPairImpl(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                     float* out1, float* scratch) {
+  const DF d;
+  const int N = static_cast<int>(hn::Lanes(d));
+  const int r = radius;
+  int xa;
+  float* tmp0 = BlurTmp(scratch, r, x0, xa);
+  float* tmp1 = tmp0 + BlurTmpFloats(x1 - x0, r);
+  const int xe = std::min(w, x1 + r + N);
+  const VF k0 = hn::Set(d, kernel[0]);
 
-  // Horizontal pass over [x0, x1), from a vector-aligned start.
-  x = x0 / N * N;
-  for (; x + 4 * N <= x1 + N - 1; x += 4 * N) {
-    const float* t = tmp + x;
-    VF a0 = hn::Mul(k0, hn::Load(d, t));
-    VF a1 = hn::Mul(k0, hn::Load(d, t + N));
-    VF a2 = hn::Mul(k0, hn::Load(d, t + 2 * N));
-    VF a3 = hn::Mul(k0, hn::Load(d, t + 3 * N));
+  int x = xa;
+  for (; x + 2 * N <= xe; x += 2 * N) {
+    VF l_a = hn::Load(d, rows[r] + x), l_b = hn::Load(d, rows[r] + x + N);
+    VF r_a = hn::Load(d, rows[r + 1] + x), r_b = hn::Load(d, rows[r + 1] + x + N);
+    VF o0a = hn::Mul(k0, l_a), o0b = hn::Mul(k0, l_b);
+    VF o1a = hn::Mul(k0, r_a), o1b = hn::Mul(k0, r_b);
+    for (int j = 1; j <= r; ++j) {
+      const float* lp = rows[r - j] + x;
+      const float* rp = rows[r + 1 + j] + x;
+      const VF k = hn::Set(d, kernel[j]);
+      const VF lj_a = hn::Load(d, lp), lj_b = hn::Load(d, lp + N);
+      const VF rj_a = hn::Load(d, rp), rj_b = hn::Load(d, rp + N);
+      o0a = hn::MulAdd(k, hn::Add(lj_a, r_a), o0a);
+      o0b = hn::MulAdd(k, hn::Add(lj_b, r_b), o0b);
+      o1a = hn::MulAdd(k, hn::Add(l_a, rj_a), o1a);
+      o1b = hn::MulAdd(k, hn::Add(l_b, rj_b), o1b);
+      l_a = lj_a;
+      l_b = lj_b;
+      r_a = rj_a;
+      r_b = rj_b;
+    }
+    hn::Store(o0a, d, tmp0 + x);
+    hn::Store(o0b, d, tmp0 + x + N);
+    hn::Store(o1a, d, tmp1 + x);
+    hn::Store(o1b, d, tmp1 + x + N);
+  }
+  for (; x < xe; x += N) {
+    VF l = hn::Load(d, rows[r] + x), rr = hn::Load(d, rows[r + 1] + x);
+    VF o0 = hn::Mul(k0, l), o1 = hn::Mul(k0, rr);
     for (int j = 1; j <= r; ++j) {
       const VF k = hn::Set(d, kernel[j]);
-      a0 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t - j), hn::LoadU(d, t + j)), a0);
-      a1 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + N - j), hn::LoadU(d, t + N + j)), a1);
-      a2 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + 2 * N - j), hn::LoadU(d, t + 2 * N + j)), a2);
-      a3 = hn::MulAdd(k, hn::Add(hn::LoadU(d, t + 3 * N - j), hn::LoadU(d, t + 3 * N + j)), a3);
+      const VF lj = hn::Load(d, rows[r - j] + x), rj = hn::Load(d, rows[r + 1 + j] + x);
+      o0 = hn::MulAdd(k, hn::Add(lj, rr), o0);
+      o1 = hn::MulAdd(k, hn::Add(l, rj), o1);
+      l = lj;
+      rr = rj;
     }
-    hn::Store(a0, d, out + x);
-    hn::Store(a1, d, out + x + N);
-    hn::Store(a2, d, out + x + 2 * N);
-    hn::Store(a3, d, out + x + 3 * N);
+    hn::Store(o0, d, tmp0 + x);
+    hn::Store(o1, d, tmp1 + x);
   }
-  for (; x < x1; x += N) {
-    VF acc = hn::Mul(k0, hn::Load(d, tmp + x));
-    for (int j = 1; j <= r; ++j) {
-      const VF pair = hn::Add(hn::LoadU(d, tmp + x - j), hn::LoadU(d, tmp + x + j));
-      acc = hn::MulAdd(hn::Set(d, kernel[j]), pair, acc);
-    }
-    hn::Store(acc, d, out + x);
-  }
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp0, out0);
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp1, out1);
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +846,7 @@ HWY_EXPORT(SubtractRowsImpl);
 HWY_EXPORT(DownsampleRowImpl);
 HWY_EXPORT(StreamRowImpl);
 HWY_EXPORT(BlurRowImpl);
+HWY_EXPORT(BlurRowPairImpl);
 HWY_EXPORT(FindExtremaRowImpl);
 HWY_EXPORT(OrientationHistogramImpl);
 HWY_EXPORT(DescriptorHistogramImpl);
@@ -804,12 +883,20 @@ void DownsampleRow(const float* in, int w_out, float* out) {
 void StreamRow(const float* src, int n, float* dst) { HWY_DYNAMIC_DISPATCH(StreamRowImpl)(src, n, dst); }
 
 std::size_t BlurRowScratchSize(int columns, int radius) {
-  return static_cast<std::size_t>(columns) + 4 * static_cast<std::size_t>(radius) + 8 * kPlaneAlign + 2 * kPlaneGuard;
+  // Two vertical-pass buffers (BlurRowPair) and the offset of the first.
+  const std::size_t tmp = static_cast<std::size_t>(
+      (columns + 4 * radius + 8 * kPlaneAlign + 2 * kPlaneGuard + kPlaneAlign - 1) / kPlaneAlign * kPlaneAlign);
+  return 2 * tmp + static_cast<std::size_t>(radius) + 4 * kPlaneAlign + kPlaneGuard;
 }
 
 void BlurRow(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out,
              float* scratch) {
   HWY_DYNAMIC_DISPATCH(BlurRowImpl)(rows, radius, kernel, w, x0, x1, out, scratch);
+}
+
+void BlurRowPair(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                 float* out1, float* scratch) {
+  HWY_DYNAMIC_DISPATCH(BlurRowPairImpl)(rows, radius, kernel, w, x0, x1, out0, out1, scratch);
 }
 
 void FindExtremaRow(const float* const* prev, const float* const* cur, const float* const* next, int xb, int xe,

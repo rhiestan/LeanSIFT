@@ -394,7 +394,7 @@ struct Sift::Impl {
     float* blur_scratch = ThreadScratch(kSlotRow, blur_floats + 4 * static_cast<std::size_t>(ring_width));
     float* up_a = blur_scratch + blur_floats;  // two upsampled rows, indexed by column
     float* up_b = up_a + 2 * ring_width;
-    std::vector<const float*> rows(2 * static_cast<std::size_t>(max_radius) + 1);
+    std::vector<const float*> rows(2 * static_cast<std::size_t>(max_radius) + 2);
 
     // Rows [start, end) of each level are computed; done = last row computed.
     std::vector<int> done(levels), end(levels);
@@ -438,7 +438,10 @@ struct Sift::Impl {
       const int cx0 = col_lo(job.margin[i]), cx1 = col_hi(job.margin[i]);
       while (done[i] < y_last) {
         const int y = done[i] + 1;
-        const int need = std::min(h - 1, y + r);
+        // Two rows at once when both are needed: the blur loads each input
+        // row once for both.
+        const int n = (r > 0 && y + 1 <= y_last) ? 2 : 1;
+        const int need = std::min(h - 1, y + n - 1 + r);
         if (i == 0) {
           ensure_source(need);
         } else {
@@ -448,17 +451,26 @@ struct Sift::Impl {
         if (r == 0) {  // level 0 without smoothing
           std::memcpy(out_row + cx0, source_row(y) + cx0, sizeof(float) * (cx1 - cx0));
         } else {
-          for (int j = -r; j <= r; ++j) {
+          for (int j = -r; j <= r + n - 1; ++j) {
             const int yy = std::clamp(y + j, 0, h - 1);
             rows[j + r] = i == 0 ? source_row(yy) : g[i - 1].row(yy);
           }
-          detail::BlurRow(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, blur_scratch);
+          if (n == 2) {
+            detail::BlurRowPair(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, g[i].row(y + 1),
+                                blur_scratch);
+          } else {
+            detail::BlurRow(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, blur_scratch);
+          }
         }
         // The tile's own part of the levels s = 0..S-1 is kept.
-        if (i >= 1 && i <= S && !job.kept.empty() && y >= y0 && y < y1) {
-          detail::StreamRow(out_row + x0, x1 - x0, job.kept[i - 1].row(y) + x0);
+        if (i >= 1 && i <= S && !job.kept.empty()) {
+          for (int k = 0; k < n; ++k) {
+            if (y + k >= y0 && y + k < y1) {
+              detail::StreamRow(g[i].row(y + k) + x0, x1 - x0, job.kept[i - 1].row(y + k) + x0);
+            }
+          }
         }
-        done[i] = y;
+        done[i] = y + n - 1;
       }
     };
 
@@ -484,10 +496,13 @@ struct Sift::Impl {
     const int det_x0 = std::max(x0, 1), det_x1 = std::min(x1, w - 1);
     const int next_x0 = x0 / 2, next_x1 = job.has_next ? std::min(x1 / 2, job.next_base.width) : 0;
 
-    for (int y = y0; y < y1; ++y) {
-      const int y_ahead = std::min(h - 1, y + R);
+    // Two detection rows per step, so that the levels are computed in pairs
+    // of rows.
+    for (int y_step = y0; y_step < y1; y_step += 2) {
+      const int y_ahead = std::min(h - 1, y_step + 1 + R);
       ensure(ensure, levels - 1, y_ahead);
       ensure_dog(y_ahead);
+      for (int y = y_step; y < std::min(y1, y_step + 2); ++y) {
 
       // The next octave starts from level s = S - 1 (index S) downsampled.
       if (job.has_next && y % 2 == 0 && y / 2 < job.next_base.height && next_x1 > next_x0) {
@@ -515,6 +530,7 @@ struct Sift::Impl {
             }
           }
         }
+      }
       }
     }
   }
@@ -689,9 +705,9 @@ struct Sift::Impl {
     }
     for (int i = 0; i < levels; ++i) {
       const int consumer = i + 1 < levels ? 2 * job.radius[i + 1] + 1 : 0;
-      job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 2;
+      job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 4;  // slack for pairs of rows
     }
-    job.dog_capacity = 2 * kRefineMargin + 2;
+    job.dog_capacity = 2 * kRefineMargin + 4;
     job.source = source;
     job.upsample_source = upsample;
     job.source_margin = job.margin[0] + job.radius[0];
