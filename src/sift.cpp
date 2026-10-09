@@ -229,7 +229,7 @@ struct Sift::Impl {
 
   PlaneBuffer input_buffer;
   PlaneBuffer base_buffers[2];
-  std::vector<PlaneBuffer> level_buffers;
+  std::vector<PlaneBuffer> level_buffers[2];  // kept levels of even and odd octaves
 
   Impl(const Params& p, Executor* e) : params(p), exec(e ? e : &default_executor()) {
     if (params.levels_per_octave < 1) throw std::invalid_argument("lsift: levels_per_octave must be >= 1");
@@ -614,6 +614,182 @@ struct Sift::Impl {
   // Main loop
   // ------------------------------------------------------------------
 
+  // The scale-space pass of one octave and its results.
+  struct OctaveScale {
+    int o = 0;
+    double xper = 1;
+    OctaveJob job;
+    std::vector<Tile> tiles;
+    int strips = 1;
+    std::vector<std::vector<Detection>> tile_detections;  // [tile * S + s]
+  };
+
+  // Keypoints of one octave and their features, computed in chunks.
+  static constexpr std::size_t kKeyChunk = 8;
+  struct KeyChunk {
+    std::vector<Keypoint> keypoints;
+    std::vector<float> descriptors;
+  };
+  struct OctaveKeys {
+    double xper = 1;
+    int o = 0;
+    std::vector<Plane> kept;
+    std::vector<Detection> keys;
+    std::vector<KeyChunk> chunks;
+  };
+
+  // Geometry of the scale space, shared by all octaves of one image.
+  struct ScaleSpace {
+    int W, H, S, o_min, num_octaves;
+    double sigma0, sigmak, sigman;
+    std::vector<std::vector<float>> kernels;  // levels i > 0
+    std::vector<int> radii;
+    int width(int o) const { return o < 0 ? W << -o : W >> o; }
+    int height(int o) const { return o < 0 ? H << -o : H >> o; }
+    bool exists(int o) const { return o < o_min + num_octaves && width(o) >= 1 && height(o) >= 1; }
+  };
+
+  // Sets up the streaming pass of octave o: blur kernels, margins, ring sizes
+  // and tiles. `kept` are the planes for its levels s = 0..S-1 (or empty).
+  OctaveScale SetupOctave(const ScaleSpace& ss, int o, const Plane& source, bool upsample,
+                          const std::vector<PlaneBuffer>& kept, int& next_base) {
+    const int S = ss.S, s_min = -1, s_max = S + 1, levels = S + 3;
+    const int w = ss.width(o), h = ss.height(o);
+    OctaveScale oc;
+    oc.o = o;
+    oc.xper = std::pow(2.0, o);
+    OctaveJob& job = oc.job;
+    job.w = w;
+    job.h = h;
+    job.S = S;
+    job.kernel = ss.kernels;
+    job.radius = ss.radii;
+    {
+      // Smoothing of level 0 relative to the source.
+      const double sa = ss.sigma0 * std::pow(ss.sigmak, s_min);
+      double sb;
+      if (o == ss.o_min) {
+        sb = ss.sigman * std::pow(2.0, -ss.o_min);
+      } else {
+        const int s_best = std::min(s_min + S, s_max);
+        sb = ss.sigma0 * std::pow(ss.sigmak, s_best - S);
+      }
+      if (sa > sb) {
+        job.kernel[0] = GaussianKernel(std::sqrt(sa * sa - sb * sb), job.radius[0]);
+      } else {
+        job.kernel[0].clear();
+        job.radius[0] = 0;
+      }
+    }
+    job.margin.assign(levels, 0);
+    job.capacity.assign(levels, 0);
+    job.margin[levels - 1] = kRefineMargin;
+    for (int i = levels - 2; i >= 0; --i) {
+      job.margin[i] = std::max(kRefineMargin, job.margin[i + 1] + job.radius[i + 1]);
+    }
+    for (int i = 0; i < levels; ++i) {
+      const int consumer = i + 1 < levels ? 2 * job.radius[i + 1] + 1 : 0;
+      job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 2;
+    }
+    job.dog_capacity = 2 * kRefineMargin + 2;
+    job.source = source;
+    job.upsample_source = upsample;
+    job.source_margin = job.margin[0] + job.radius[0];
+    job.source_capacity = 2 * job.radius[0] + 3;
+    job.threshold = static_cast<float>(0.8 * params.peak_threshold);
+    for (const PlaneBuffer& b : kept) job.kept.push_back(b.plane(w, h));
+    job.has_next = ss.exists(o + 1);
+    if (job.has_next) {
+      // Alternate between the two base planes; the source may be one of them.
+      if (source.data == base_buffers[next_base].plane(1, 1).data) next_base ^= 1;
+      job.next_base = base_buffers[next_base].plane(ss.width(o + 1), ss.height(o + 1));
+    }
+
+    // Tiles: about kTileWidth columns wide, so that the rings of a tile stay
+    // small, and about two per thread, while at least twice the margin in
+    // each direction so that the recomputed rows and columns stay a small
+    // fraction. Tile columns start at multiples of 32 so that the next
+    // octave's columns start aligned.
+    constexpr int kTileWidth = 1024;
+    const int threads = static_cast<int>(std::max(1u, exec->concurrency()));
+    const int min_size = std::max(32, 2 * job.margin[0]);
+    const int planned = std::max(1, std::min((w + kTileWidth / 2) / kTileWidth, w / min_size));
+    const int strip_w = RoundUp((w + planned - 1) / planned, 32);
+    oc.strips = (w + strip_w - 1) / strip_w;
+    const int wanted_bands = (2 * threads + oc.strips - 1) / oc.strips;
+    const int bands = std::max(1, std::min(wanted_bands, h / min_size));
+    const int band_h = (h + bands - 1) / bands;
+    for (int y = 0; y < h; y += band_h) {
+      for (int x = 0; x < w; x += strip_w) oc.tiles.push_back({x, std::min(w, x + strip_w), y, std::min(h, y + band_h)});
+    }
+    oc.tile_detections.assign(oc.tiles.size() * S, {});
+    return oc;
+  }
+
+  void RunTile(OctaveScale& oc, std::size_t t, double sigma0) const {
+    ProcessTile(oc.job, oc.tiles[t], oc.xper, sigma0, &oc.tile_detections[t * oc.job.S]);
+  }
+
+  // VLFeat lists the keypoints of an octave by level, then by the row and
+  // column where the extremum was found. Tiles are band-major and each lists
+  // a level in row-major order, so per level and band it is enough to merge
+  // the band's tiles by row; a stable sort keeps the column order.
+  OctaveKeys CollectKeys(const OctaveScale& oc) const {
+    const int S = oc.job.S;
+    OctaveKeys k;
+    k.xper = oc.xper;
+    k.o = oc.o;
+    k.kept = oc.job.kept;
+    std::size_t total = 0;
+    for (const auto& v : oc.tile_detections) total += v.size();
+    k.keys.reserve(total);
+    const std::size_t bands = oc.tiles.size() / oc.strips;
+    for (int s = 0; s < S; ++s) {
+      for (std::size_t b = 0; b < bands; ++b) {
+        const std::size_t start = k.keys.size();
+        for (int x = 0; x < oc.strips; ++x) {
+          const auto& v = oc.tile_detections[(b * oc.strips + x) * S + s];
+          k.keys.insert(k.keys.end(), v.begin(), v.end());
+        }
+        if (oc.strips > 1) {
+          std::stable_sort(k.keys.begin() + start, k.keys.end(),
+                           [](const Detection& a, const Detection& c) { return a.cy < c.cy; });
+        }
+      }
+    }
+    k.chunks.resize((k.keys.size() + kKeyChunk - 1) / kKeyChunk);
+    return k;
+  }
+
+  // Orientations and descriptors of the keypoints in chunk c.
+  void RunKeyChunk(OctaveKeys& k, std::size_t c) const {
+    KeyChunk& chunk = k.chunks[c];
+    chunk.keypoints.clear();
+    chunk.descriptors.clear();
+    const std::size_t end = std::min(k.keys.size(), (c + 1) * kKeyChunk);
+    for (std::size_t i = c * kKeyChunk; i < end; ++i) {
+      const Detection& d = k.keys[i];
+      double angles[4] = {0, 0, 0, 0};
+      const int n = params.upright ? 1 : Orientations(k.kept[d.is], d, k.xper, angles);
+      for (int a = 0; a < n; ++a) {
+        Keypoint kp;
+        kp.x = static_cast<float>(d.x);
+        kp.y = static_cast<float>(d.y);
+        kp.sigma = static_cast<float>(d.sigma);
+        kp.angle = static_cast<float>(angles[a]);
+        kp.response = d.response;
+        kp.octave = k.o;
+        kp.level = static_cast<float>(d.s);
+        chunk.keypoints.push_back(kp);
+        if (params.compute_descriptors) {
+          chunk.descriptors.resize(chunk.descriptors.size() + kDescriptorSize);
+          Descriptor(k.kept[d.is], d, angles[a], k.xper,
+                     chunk.descriptors.data() + chunk.descriptors.size() - kDescriptorSize);
+        }
+      }
+    }
+  }
+
   void Extract(const ImageView& image, Features& out) {
     out.keypoints.clear();
     out.descriptors.clear();
@@ -621,51 +797,56 @@ struct Sift::Impl {
       throw std::invalid_argument("lsift: empty image");
     }
 
-    const int W = image.width, H = image.height;
-    const int S = params.levels_per_octave;
-    const int o_min = params.first_octave;
-    const int s_min = -1, s_max = S + 1;
-    const int levels = s_max - s_min + 1;
-
-    int num_octaves = params.num_octaves;
-    if (num_octaves < 0) {
-      num_octaves = std::max(static_cast<int>(std::floor(std::log2(std::min(W, H)))) - o_min - 3, 1);
+    ScaleSpace ss;
+    ss.W = image.width;
+    ss.H = image.height;
+    ss.S = params.levels_per_octave;
+    ss.o_min = params.first_octave;
+    const int S = ss.S, o_min = ss.o_min, s_min = -1, s_max = S + 1, levels = S + 3;
+    ss.num_octaves = params.num_octaves;
+    if (ss.num_octaves < 0) {
+      ss.num_octaves = std::max(static_cast<int>(std::floor(std::log2(std::min(ss.W, ss.H)))) - o_min - 3, 1);
     }
+    ss.sigmak = std::pow(2.0, 1.0 / S);
+    ss.sigma0 = params.base_sigma * ss.sigmak;
+    ss.sigman = params.nominal_sigma;
+    const double dsigma0 = ss.sigma0 * std::sqrt(1.0 - 1.0 / (ss.sigmak * ss.sigmak));
+    if (!ss.exists(o_min)) return;
+    const int W = ss.W, H = ss.H;
+    const int w0 = ss.width(o_min), h0 = ss.height(o_min);
 
-    const double sigmak = std::pow(2.0, 1.0 / S);
-    const double sigma0 = params.base_sigma * sigmak;
-    const double sigman = params.nominal_sigma;
-    const double dsigma0 = sigma0 * std::sqrt(1.0 - 1.0 / (sigmak * sigmak));
-
-    auto octave_width = [&](int o) { return o < 0 ? W << -o : W >> o; };
-    auto octave_height = [&](int o) { return o < 0 ? H << -o : H >> o; };
-    const int w0 = octave_width(o_min), h0 = octave_height(o_min);
-    if (w0 < 1 || h0 < 1) return;
-
+    // Levels s = 0..S-1 of consecutive octaves go to two sets of planes, so
+    // that one octave's keypoints can be processed while the next octave's
+    // scale space is computed.
     const bool keep_levels = !params.upright || params.compute_descriptors;
     input_buffer.reserve(PlaneFloats(W, H));
-    const std::size_t base_floats =
-        std::max(PlaneFloats(octave_width(o_min + 1), octave_height(o_min + 1)),
-                 o_min > 0 ? PlaneFloats(w0, h0) : std::size_t{0});
+    const std::size_t base_floats = std::max(PlaneFloats(ss.width(o_min + 1), ss.height(o_min + 1)),
+                                             o_min > 0 ? PlaneFloats(w0, h0) : std::size_t{0});
     for (auto& b : base_buffers) b.reserve(base_floats);
-    if (keep_levels) {
-      if (level_buffers.size() < static_cast<std::size_t>(S)) level_buffers.resize(S);
-      for (auto& b : level_buffers) b.reserve(PlaneFloats(w0, h0));
+    for (int set = 0; set < 2; ++set) {
+      auto& levels_set = level_buffers[set];
+      if (!keep_levels) {
+        levels_set.clear();
+        continue;
+      }
+      if (levels_set.size() != static_cast<std::size_t>(S)) levels_set.resize(S);
+      const int o = o_min + set;
+      for (auto& b : levels_set) b.reserve(PlaneFloats(ss.width(o), ss.height(o)));
     }
 
-    // Blur kernels: level 0 smooths the source, level i > 0 the level below.
-    // They do not depend on the octave, except for level 0 of the first one.
-    std::vector<std::vector<float>> kernels(levels);
-    std::vector<int> radii(levels, 0);
+    // Blur kernels: level i > 0 smooths level i - 1. They are the same for
+    // every octave; level 0 is set per octave.
+    ss.kernels.assign(levels, {});
+    ss.radii.assign(levels, 0);
     for (int s = s_min + 1; s <= s_max; ++s) {
-      kernels[s - s_min] = GaussianKernel(dsigma0 * std::pow(sigmak, s), radii[s - s_min]);
+      ss.kernels[s - s_min] = GaussianKernel(dsigma0 * std::pow(ss.sigmak, s), ss.radii[s - s_min]);
     }
 
     LSIFT_PROFILER();
     const Plane input = input_buffer.plane(W, H);
     ForRows(H, RowGrain(W, 1 << 16), [&](int y0, int y1) { detail::ConvertRows(image, input, y0, y1); });
 
-    Plane source = input;  // level 0 of the current octave comes from here
+    Plane source = input;  // level 0 of the first octave comes from here
     bool upsample = false;
     if (o_min < 0) {
       // Double the image -o_min - 1 times here; the last doubling is done
@@ -687,177 +868,64 @@ struct Sift::Impl {
     }
     LSIFT_MARK("input");
 
-    std::vector<std::vector<Detection>> tile_detections;  // [tile * S + s]
-    std::vector<Tile> tiles;
+    // Pipeline: one parallel job computes the scale space of octave o + 1
+    // and the orientations and descriptors of octave o. The tiles come first
+    // in the job because they are the larger items.
     int next_base = 0;
+    OctaveScale cur = SetupOctave(ss, o_min, source, upsample, level_buffers[0], next_base);
+    exec->parallel_for(cur.tiles.size(), 1, [&](std::size_t b, std::size_t e) {
+      for (std::size_t t = b; t < e; ++t) RunTile(cur, t, ss.sigma0);
+    });
+    LSIFT_MARK("scale space");
 
-    for (int o = o_min; o < o_min + num_octaves; ++o) {
-      const int w = octave_width(o), h = octave_height(o);
-      if (w < 1 || h < 1) break;
-      const double xper = std::pow(2.0, o);
-
-      // ---- Set up the streaming pass ----------------------------------------
-      OctaveJob job;
-      job.w = w;
-      job.h = h;
-      job.S = S;
-      job.kernel = kernels;
-      job.radius = radii;
-      {
-        // Smoothing of level 0 relative to the source.
-        double sa = sigma0 * std::pow(sigmak, s_min), sb;
-        if (o == o_min) {
-          sb = sigman * std::pow(2.0, -o_min);
-        } else {
-          const int s_best = std::min(s_min + S, s_max);
-          sb = sigma0 * std::pow(sigmak, s_best - S);
+    std::vector<OctaveKeys> done;
+    OctaveKeys keys = CollectKeys(cur);
+    LSIFT_MARK("collect");
+    for (int o = o_min;; ++o) {
+      const bool more = ss.exists(o + 1);
+      OctaveScale nxt;
+      if (more) {
+        nxt = SetupOctave(ss, o + 1, cur.job.next_base, false, level_buffers[(o + 1 - o_min) % 2], next_base);
+      }
+      const std::size_t num_tiles = nxt.tiles.size();
+      const std::size_t num_chunks = keys.chunks.size();
+      exec->parallel_for(num_tiles + num_chunks, 1, [&](std::size_t b, std::size_t e) {
+        for (std::size_t t = b; t < e; ++t) {
+          if (t < num_tiles) {
+            RunTile(nxt, t, ss.sigma0);
+          } else {
+            RunKeyChunk(keys, t - num_tiles);
+          }
         }
-        if (sa > sb) {
-          job.kernel[0] = GaussianKernel(std::sqrt(sa * sa - sb * sb), job.radius[0]);
-        } else {
-          job.kernel[0].clear();
-          job.radius[0] = 0;
-        }
-      }
-      job.margin.assign(levels, 0);
-      job.capacity.assign(levels, 0);
-      job.margin[levels - 1] = kRefineMargin;
-      for (int i = levels - 2; i >= 0; --i) {
-        job.margin[i] = std::max(kRefineMargin, job.margin[i + 1] + job.radius[i + 1]);
-      }
-      for (int i = 0; i < levels; ++i) {
-        const int consumer = i + 1 < levels ? 2 * job.radius[i + 1] + 1 : 0;
-        job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 2;
-      }
-      job.dog_capacity = 2 * kRefineMargin + 2;
-      job.source = source;
-      job.upsample_source = upsample;
-      job.source_margin = job.margin[0] + job.radius[0];
-      job.source_capacity = 2 * job.radius[0] + 3;
-      job.threshold = static_cast<float>(0.8 * params.peak_threshold);
-      if (keep_levels) {
-        for (int s = 0; s < S; ++s) job.kept.push_back(level_buffers[s].plane(w, h));
-      }
-      const int wn = octave_width(o + 1), hn = octave_height(o + 1);
-      job.has_next = o + 1 < o_min + num_octaves && wn >= 1 && hn >= 1;
-      if (job.has_next) {
-        // Alternate between the two base planes; the source may be one of them.
-        if (source.data == base_buffers[next_base].plane(1, 1).data) next_base ^= 1;
-        job.next_base = base_buffers[next_base].plane(wn, hn);
-      }
-
-      // Tiles: about kTileWidth columns wide, so that the rings of a tile stay
-      // small, and about two per thread, while at least twice the margin in
-      // each direction so that the recomputed rows and columns stay a small
-      // fraction. Tile columns start at multiples of 32 so that the next
-      // octave's columns start aligned.
-      int strips = 1;
-      {
-        constexpr int kTileWidth = 1024;
-        const int threads = static_cast<int>(std::max(1u, exec->concurrency()));
-        const int min_size = std::max(32, 2 * job.margin[0]);
-        const int planned = std::max(1, std::min((w + kTileWidth / 2) / kTileWidth, w / min_size));
-        const int strip_w = RoundUp((w + planned - 1) / planned, 32);
-        strips = (w + strip_w - 1) / strip_w;
-        const int wanted_bands = (2 * threads + strips - 1) / strips;
-        const int bands = std::max(1, std::min(wanted_bands, h / min_size));
-        const int band_h = (h + bands - 1) / bands;
-        tiles.clear();
-        for (int y = 0; y < h; y += band_h) {
-          for (int x = 0; x < w; x += strip_w) tiles.push_back({x, std::min(w, x + strip_w), y, std::min(h, y + band_h)});
-        }
-      }
-      tile_detections.assign(tiles.size() * S, {});
-      LSIFT_MARK("setup");
-      exec->parallel_for(tiles.size(), 1, [&](std::size_t b, std::size_t e) {
-        for (std::size_t t = b; t < e; ++t) ProcessTile(job, tiles[t], xper, sigma0, &tile_detections[t * S]);
       });
-#ifdef LSIFT_PROFILE
-      {
-        static const char* kNames[] = {"scale o-2", "scale o-1", "scale o0", "scale o1", "scale o2", "scale o3",
-                                       "scale o4",  "scale o5",  "scale o6", "scale o7", "scale o8+"};
-        LSIFT_MARK(kNames[std::clamp(o + 2, 0, 10)]);
-      }
-#endif
-
-      if (job.has_next) source = job.next_base;
-      upsample = false;
-
-      // VLFeat lists the keypoints of an octave by level, then by the row and
-      // column where the extremum was found. Tiles are band-major and each
-      // lists a level in row-major order, so per level and band it is enough
-      // to merge the band's tiles by row; a stable sort keeps the column order.
-      std::vector<Detection> keys;
-      {
-        std::size_t total = 0;
-        for (const auto& v : tile_detections) total += v.size();
-        keys.reserve(total);
-        const std::size_t bands = tiles.size() / strips;
-        for (int s = 0; s < S; ++s) {
-          for (std::size_t b = 0; b < bands; ++b) {
-            const std::size_t start = keys.size();
-            for (int x = 0; x < strips; ++x) {
-              const auto& v = tile_detections[(b * strips + x) * S + s];
-              keys.insert(keys.end(), v.begin(), v.end());
-            }
-            if (strips > 1) {
-              std::stable_sort(keys.begin() + start, keys.end(),
-                               [](const Detection& a, const Detection& c) { return a.cy < c.cy; });
-            }
-          }
-        }
-      }
+      LSIFT_MARK("octave pipeline");
+      done.push_back(std::move(keys));
+      if (!more) break;
+      cur = std::move(nxt);
+      keys = CollectKeys(cur);
       LSIFT_MARK("collect");
-      if (keys.empty()) continue;
-
-      // ---- Orientations ---------------------------------------------------
-      std::vector<double> angles(keys.size() * 4, 0.0);
-      std::vector<int> num_angles(keys.size(), 1);
-      if (!params.upright) {
-        exec->parallel_for(keys.size(), 16, [&](std::size_t b, std::size_t e) {
-          for (std::size_t i = b; i < e; ++i) {
-            num_angles[i] =
-                Orientations(job.kept[keys[i].is], keys[i], xper, &angles[4 * i]);
-          }
-        });
-      }
-      LSIFT_MARK("orientation");
-      std::vector<std::size_t> offset(keys.size() + 1, 0);
-      for (std::size_t i = 0; i < keys.size(); ++i) offset[i + 1] = offset[i] + num_angles[i];
-
-      const std::size_t first = out.keypoints.size();
-      const std::size_t count = offset.back();
-      out.keypoints.resize(first + count);
-      if (params.compute_descriptors) out.descriptors.resize((first + count) * kDescriptorSize);
-      for (std::size_t i = 0; i < keys.size(); ++i) {
-        for (int a = 0; a < num_angles[i]; ++a) {
-          Keypoint& kp = out.keypoints[first + offset[i] + a];
-          kp.x = static_cast<float>(keys[i].x);
-          kp.y = static_cast<float>(keys[i].y);
-          kp.sigma = static_cast<float>(keys[i].sigma);
-          kp.angle = static_cast<float>(angles[4 * i + a]);
-          kp.response = keys[i].response;
-          kp.octave = o;
-          kp.level = static_cast<float>(keys[i].s);
-        }
-      }
-
-      LSIFT_MARK("output");
-      // ---- Descriptors ----------------------------------------------------
-      if (params.compute_descriptors) {
-        exec->parallel_for(count, 8, [&](std::size_t b, std::size_t e) {
-          // Map output index -> keypoint by binary search on the offsets.
-          std::size_t i = static_cast<std::size_t>(std::upper_bound(offset.begin(), offset.end(), b) - offset.begin()) - 1;
-          for (std::size_t j = b; j < e; ++j) {
-            while (offset[i + 1] <= j) ++i;
-            const Detection& k = keys[i];
-            Descriptor(job.kept[k.is], k, angles[4 * i + (j - offset[i])], xper,
-                       out.descriptors.data() + (first + j) * kDescriptorSize);
-          }
-        });
-      }
-      LSIFT_MARK("descriptor");
     }
+
+    // Copy the chunks to the output in order.
+    std::vector<std::pair<const KeyChunk*, std::size_t>> chunks;  // chunk, first keypoint
+    std::size_t total = 0;
+    for (const OctaveKeys& k : done) {
+      for (const KeyChunk& c : k.chunks) {
+        chunks.emplace_back(&c, total);
+        total += c.keypoints.size();
+      }
+    }
+    out.keypoints.resize(total);
+    if (params.compute_descriptors) out.descriptors.resize(total * kDescriptorSize);
+    exec->parallel_for(chunks.size(), 64, [&](std::size_t b, std::size_t e) {
+      for (std::size_t i = b; i < e; ++i) {
+        const KeyChunk& c = *chunks[i].first;
+        std::copy(c.keypoints.begin(), c.keypoints.end(), out.keypoints.begin() + chunks[i].second);
+        std::copy(c.descriptors.begin(), c.descriptors.end(),
+                  out.descriptors.begin() + chunks[i].second * kDescriptorSize);
+      }
+    });
+    LSIFT_MARK("output");
   }
 };
 
