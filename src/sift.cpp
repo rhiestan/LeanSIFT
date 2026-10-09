@@ -1,0 +1,879 @@
+// LeanSift - fast SIFT feature extraction
+// SPDX-License-Identifier: BSD-2-Clause
+//
+// The algorithm follows VLFeat's sift.c (vl_sift_process_first_octave,
+// vl_sift_process_next_octave, vl_sift_detect,
+// vl_sift_calc_keypoint_orientations and vl_sift_calc_keypoint_descriptor),
+// with the same parameters, conventions and output order.
+//
+// The organisation differs: VLFeat stores every Gaussian and DoG level of an
+// octave as a full image, which makes it limited by memory bandwidth. Here an
+// octave is processed in one streaming pass per tile: each Gaussian level is
+// kept only in a small ring of rows, and the DoG, extremum
+// detection, sub-pixel refinement and the next octave's base image are
+// computed while the rows are still in cache. Only the levels s = 0..S-1
+// (needed later for orientations and descriptors, which compute gradients on
+// the fly) and the next base image are written to memory. Tiles run in
+// parallel; each recomputes a margin of its neighbours.
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+#include <utility>
+
+#ifdef LSIFT_PROFILE
+#include <chrono>
+#include <cstdio>
+#include <map>
+#include <string>
+#endif
+
+#include "hwy/aligned_allocator.h"
+#include "kernels.h"
+#include "lsift/lsift.hpp"
+
+namespace lsift {
+namespace {
+
+using detail::kPlaneAlign;
+using detail::kPlaneGuard;
+using detail::Plane;
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kEpsilonD = 2.220446049250313e-16;  // VL_EPSILON_D
+constexpr float kEpsilonF = 1.19209290E-07F;         // VL_EPSILON_F
+constexpr int kNBP = 4;
+constexpr int kNBO = 8;
+constexpr int kOrientationBins = 36;
+
+// Rows of DoG kept around a detection row. Refinement moves a keypoint by at
+// most four pixels and then reads one more row on each side.
+constexpr int kRefineMargin = 7;
+
+int RoundUp(int x, int m) { return (x + m - 1) / m * m; }
+
+// Rows padded to a multiple of 16 floats. Strides that are a multiple of 4 KiB
+// are bumped so the rows of a vertical filter do not alias in the L1 cache.
+std::ptrdiff_t StrideFor(int width) {
+  int s = RoundUp(std::max(width, 1), kPlaneAlign);
+  if (s % 1024 == 0) s += kPlaneAlign;
+  return s;
+}
+
+std::size_t PlaneFloats(int width, int height) {
+  return static_cast<std::size_t>(StrideFor(width)) * static_cast<std::size_t>(std::max(height, 1));
+}
+
+// Zero-initialized storage for one plane with guards on both sides.
+class PlaneBuffer {
+public:
+  void reserve(std::size_t floats) {
+    if (floats <= capacity_) return;
+    mem_ = hwy::AllocateAligned<float>(floats + 2 * kPlaneGuard);
+    if (!mem_) throw std::bad_alloc();
+    std::fill(mem_.get(), mem_.get() + floats + 2 * kPlaneGuard, 0.0f);
+    capacity_ = floats;
+  }
+  Plane plane(int width, int height) const {
+    return Plane{mem_.get() + kPlaneGuard, width, height, StrideFor(width)};
+  }
+
+private:
+  hwy::AlignedFreeUniquePtr<float[]> mem_;
+  std::size_t capacity_ = 0;
+};
+
+// Aligned, zero-initialized scratch memory owned by each thread. Separate
+// slots can be in use at the same time.
+enum ScratchSlot { kSlotRings, kSlotRow, kSlotKernel, kNumSlots };
+
+float* ThreadScratch(ScratchSlot slot, std::size_t floats) {
+  struct Buffer {
+    hwy::AlignedFreeUniquePtr<float[]> mem;
+    std::size_t capacity = 0;
+  };
+  thread_local Buffer buffers[kNumSlots];
+  Buffer& b = buffers[slot];
+  if (floats > b.capacity) {
+    const std::size_t capacity = std::max(floats, b.capacity + b.capacity / 2);
+    b.mem = hwy::AllocateAligned<float>(capacity);
+    if (!b.mem) throw std::bad_alloc();
+    std::fill(b.mem.get(), b.mem.get() + capacity, 0.0f);
+    b.capacity = capacity;
+  }
+  return b.mem.get();
+}
+
+// Right half k[0..radius] of a normalized Gaussian, built like VLFeat's
+// _vl_sift_smooth.
+std::vector<float> GaussianKernel(double sigma, int& radius) {
+  radius = std::max(static_cast<int>(std::ceil(4.0 * sigma)), 1);
+  std::vector<float> full(2 * static_cast<std::size_t>(radius) + 1);
+  float acc = 0;
+  for (int j = 0; j < 2 * radius + 1; ++j) {
+    const float d = static_cast<float>(j - radius) / static_cast<float>(sigma);
+    full[j] = static_cast<float>(std::exp(-0.5 * (d * d)));
+    acc += full[j];
+  }
+  std::vector<float> half(static_cast<std::size_t>(radius) + 1);
+  for (int j = 0; j <= radius; ++j) half[j] = full[radius + j] / acc;
+  return half;
+}
+
+// Rows per task so that each task has roughly `pixels` pixels of work.
+std::size_t RowGrain(int width, int pixels) { return static_cast<std::size_t>(std::max(1, pixels / std::max(width, 1))); }
+
+// Development aid: with LSIFT_PROFILE defined, Extract prints the time spent
+// in each phase to stderr.
+#ifdef LSIFT_PROFILE
+class PhaseProfiler {
+public:
+  PhaseProfiler() : last_(Clock::now()) {}
+  ~PhaseProfiler() {
+    double total = 0;
+    for (const auto& [name, ms] : totals_) total += ms;
+    std::fprintf(stderr, "lsift profile: total %.2f ms\n", total);
+    for (const auto& [name, ms] : totals_) {
+      std::fprintf(stderr, "  %-12s %8.2f ms %5.1f%%\n", name.c_str(), ms, 100 * ms / total);
+    }
+  }
+  void mark(const char* phase) {
+    const auto now = Clock::now();
+    totals_[phase] += std::chrono::duration<double, std::milli>(now - last_).count();
+    last_ = now;
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point last_;
+  std::map<std::string, double> totals_;
+};
+#define LSIFT_PROFILER() PhaseProfiler lsift_profiler_
+#define LSIFT_MARK(phase) lsift_profiler_.mark(phase)
+#else
+#define LSIFT_PROFILER() static_cast<void>(0)
+#define LSIFT_MARK(phase) static_cast<void>(0)
+#endif
+
+// A keypoint after sub-pixel refinement, in VLFeat's VlSiftKeypoint terms.
+struct Detection {
+  double x, y;   // input-image coordinates
+  double sigma;  // input-image scale
+  double s;      // fractional level
+  int is;        // integer level the extremum was found on
+  float response;
+  int cx, cy;    // pixel where the extremum was found, for VLFeat's order
+};
+
+// Rows of one level as a tile sees them, in a circular buffer: row y lives in
+// slot y % capacity. Pointers are indexed by image column; a slot holds the
+// columns [col_base, col_base + stride).
+struct RowRing {
+  float* base = nullptr;
+  int capacity = 1;
+  std::ptrdiff_t stride = 0;
+  int col_base = 0;
+
+  float* row(int y) const { return base + static_cast<std::ptrdiff_t>(y % capacity) * stride - col_base; }
+};
+
+// A rectangle of an octave whose keypoints one task finds.
+struct Tile {
+  int x0, x1, y0, y1;
+};
+
+// Everything a tile needs to process one octave.
+struct OctaveJob {
+  int w = 0, h = 0;
+  int S = 0;  // levels per octave
+
+  // Gaussian level i = 0..S+2 holds VLFeat's level s = i - 1. Level i > 0 is
+  // level i - 1 blurred with kernel[i]; level 0 is the source blurred with
+  // kernel[0], or a copy of it when radius[0] == 0.
+  std::vector<std::vector<float>> kernel;
+  std::vector<int> radius;
+  std::vector<int> margin;    // rows and columns beyond the tile each level is computed for
+  std::vector<int> capacity;  // ring rows per level
+  int dog_capacity = 0;
+
+  // Source of level 0: the rows of `source`, or `source` upsampled by two.
+  Plane source;
+  bool upsample_source = false;
+  int source_margin = 0;
+  int source_capacity = 0;
+
+  float threshold = 0;          // 0.8 * peak threshold, as in VLFeat
+  // Levels s = 0..S-1 kept for orientations and descriptors (empty when not
+  // needed).
+  std::vector<Plane> kept;
+  bool has_next = false;  // write next_base
+  Plane next_base;
+};
+
+}  // namespace
+
+std::vector<std::uint8_t> Features::descriptors_u8() const {
+  std::vector<std::uint8_t> out(descriptors.size());
+  for (std::size_t i = 0; i < descriptors.size(); ++i) {
+    out[i] = static_cast<std::uint8_t>(std::min(512.0f * descriptors[i], 255.0f));
+  }
+  return out;
+}
+
+const char* simd_target_name() { return detail::TargetName(); }
+
+struct Sift::Impl {
+  Params params;
+  Executor* exec;
+
+  PlaneBuffer input_buffer;
+  PlaneBuffer base_buffers[2];
+  std::vector<PlaneBuffer> level_buffers;
+
+  Impl(const Params& p, Executor* e) : params(p), exec(e ? e : &default_executor()) {
+    if (params.levels_per_octave < 1) throw std::invalid_argument("lsift: levels_per_octave must be >= 1");
+    if (params.magnification <= 0 || params.window_size <= 0)
+      throw std::invalid_argument("lsift: magnification and window_size must be positive");
+    params.max_orientations = std::clamp(params.max_orientations, 1, 4);
+  }
+
+  template <class F>
+  void ForRows(int height, std::size_t grain, F&& f) {
+    exec->parallel_for(static_cast<std::size_t>(height), grain, [&](std::size_t b, std::size_t e) {
+      f(static_cast<int>(b), static_cast<int>(e));
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Refinement (vl_sift_detect, second half). Double precision as in VLFeat.
+  // `dog(dx, dy, ds)` returns the DoG at the current position plus offsets.
+  // ------------------------------------------------------------------
+
+  template <class DogAt>
+  bool Refine(DogAt&& dog_at, int w, int h, int s, int x, int y, double xper, double sigma0, Detection& out) const {
+    const int s_min = -1, s_max = params.levels_per_octave + 1;
+    const int S = params.levels_per_octave;
+    const double te = params.edge_threshold;
+    const double tp = params.peak_threshold;
+    auto at = [&](int dx, int dy, int ds) -> double { return dog_at(x + dx, y + dy, s + ds); };
+
+    double Dx = 0, Dy = 0, Ds = 0, Dxx = 0, Dyy = 0, Dss = 0, Dxy = 0, Dxs = 0, Dys = 0;
+    double A[9], b[3];
+    int dx = 0, dy = 0;
+
+    for (int iter = 0; iter < 5; ++iter) {
+      x += dx;
+      y += dy;
+
+      Dx = 0.5 * (at(+1, 0, 0) - at(-1, 0, 0));
+      Dy = 0.5 * (at(0, +1, 0) - at(0, -1, 0));
+      Ds = 0.5 * (at(0, 0, +1) - at(0, 0, -1));
+      Dxx = (at(+1, 0, 0) + at(-1, 0, 0) - 2.0 * at(0, 0, 0));
+      Dyy = (at(0, +1, 0) + at(0, -1, 0) - 2.0 * at(0, 0, 0));
+      Dss = (at(0, 0, +1) + at(0, 0, -1) - 2.0 * at(0, 0, 0));
+      Dxy = 0.25 * (at(+1, +1, 0) + at(-1, -1, 0) - at(-1, +1, 0) - at(+1, -1, 0));
+      Dxs = 0.25 * (at(+1, 0, +1) + at(-1, 0, -1) - at(-1, 0, +1) - at(+1, 0, -1));
+      Dys = 0.25 * (at(0, +1, +1) + at(0, -1, -1) - at(0, -1, +1) - at(0, +1, -1));
+
+      auto Aat = [&](int i, int j) -> double& { return A[i + j * 3]; };
+      Aat(0, 0) = Dxx;
+      Aat(1, 1) = Dyy;
+      Aat(2, 2) = Dss;
+      Aat(0, 1) = Aat(1, 0) = Dxy;
+      Aat(0, 2) = Aat(2, 0) = Dxs;
+      Aat(1, 2) = Aat(2, 1) = Dys;
+      b[0] = -Dx;
+      b[1] = -Dy;
+      b[2] = -Ds;
+
+      // Gauss elimination with partial pivoting.
+      for (int j = 0; j < 3; ++j) {
+        double maxa = 0, maxabsa = 0;
+        int maxi = -1;
+        for (int i = j; i < 3; ++i) {
+          const double a = Aat(i, j);
+          const double absa = std::fabs(a);
+          if (absa > maxabsa) {
+            maxa = a;
+            maxabsa = absa;
+            maxi = i;
+          }
+        }
+        if (maxabsa < 1e-10f) {  // singular: give up on this step
+          b[0] = b[1] = b[2] = 0;
+          break;
+        }
+        const int i = maxi;
+        for (int jj = j; jj < 3; ++jj) {
+          std::swap(Aat(i, jj), Aat(j, jj));
+          Aat(j, jj) /= maxa;
+        }
+        std::swap(b[j], b[i]);
+        b[j] /= maxa;
+        for (int ii = j + 1; ii < 3; ++ii) {
+          const double f = Aat(ii, j);
+          for (int jj = j; jj < 3; ++jj) Aat(ii, jj) -= f * Aat(j, jj);
+          b[ii] -= f * b[j];
+        }
+      }
+      for (int i = 2; i > 0; --i) {
+        const double v = b[i];
+        for (int ii = i - 1; ii >= 0; --ii) b[ii] -= v * Aat(ii, i);
+      }
+
+      // Move to the neighbouring pixel if the offset is large.
+      dx = ((b[0] > 0.6 && x < w - 2) ? 1 : 0) + ((b[0] < -0.6 && x > 1) ? -1 : 0);
+      dy = ((b[1] > 0.6 && y < h - 2) ? 1 : 0) + ((b[1] < -0.6 && y > 1) ? -1 : 0);
+      if (dx == 0 && dy == 0) break;
+    }
+
+    const double val = at(0, 0, 0) + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]);
+    const double score = (Dxx + Dyy) * (Dxx + Dyy) / (Dxx * Dyy - Dxy * Dxy);
+    const double xn = x + b[0];
+    const double yn = y + b[1];
+    const double sn = s + b[2];
+
+    const bool good = std::fabs(val) > tp && score < (te + 1) * (te + 1) / te && score >= 0 &&
+                      std::fabs(b[0]) < 1.5 && std::fabs(b[1]) < 1.5 && std::fabs(b[2]) < 1.5 && xn >= 0 &&
+                      xn <= w - 1 && yn >= 0 && yn <= h - 1 && sn >= s_min && sn <= s_max;
+    if (!good) return false;
+
+    out.x = xn * xper;
+    out.y = yn * xper;
+    out.s = sn;
+    out.is = s;
+    out.sigma = sigma0 * std::pow(2.0, sn / S) * xper;
+    out.response = static_cast<float>(val);
+    return true;
+  }
+
+  // ------------------------------------------------------------------
+  // One tile of an octave
+  // ------------------------------------------------------------------
+
+  // Appends the keypoints found on level s to out[s], in row-major order.
+  void ProcessTile(const OctaveJob& job, const Tile& tile, double xper, double sigma0,
+                   std::vector<Detection>* out) const {
+    const int w = job.w, h = job.h, S = job.S;
+    const int levels = S + 3, dogs = S + 2;
+    const int y0 = tile.y0, y1 = tile.y1, x0 = tile.x0, x1 = tile.x1;
+    constexpr int R = kRefineMargin;
+
+    // Columns computed for each level: the tile plus its margin.
+    auto col_lo = [&](int margin) { return std::max(0, x0 - margin); };
+    auto col_hi = [&](int margin) { return std::min(w, x1 + margin); };
+    const int widest = std::max(job.source_margin, job.margin[0]);
+    const int col_base = col_lo(widest) / kPlaneAlign * kPlaneAlign;
+    int ring_width = RoundUp(col_hi(widest) - col_base, kPlaneAlign) + 4 * kPlaneAlign;
+    if (ring_width % 1024 == 0) ring_width += kPlaneAlign;
+
+    // Carve the rings out of one thread-local buffer, with a guard before
+    // each ring.
+    std::size_t ring_rows = static_cast<std::size_t>(dogs) * job.dog_capacity;
+    for (int c : job.capacity) ring_rows += c;
+    if (job.upsample_source) ring_rows += job.source_capacity;
+    const std::size_t ring_floats =
+        ring_rows * ring_width + static_cast<std::size_t>(levels + dogs + 2) * kPlaneGuard;
+    float* mem = ThreadScratch(kSlotRings, ring_floats + kPlaneGuard);
+    auto take = [&](int rows) {
+      mem += kPlaneGuard;
+      RowRing r{mem, rows, ring_width, col_base};
+      mem += static_cast<std::ptrdiff_t>(rows) * ring_width;
+      return r;
+    };
+    std::vector<RowRing> g(levels), dog(dogs);
+    RowRing src;
+    if (job.upsample_source) src = take(job.source_capacity);
+    for (int i = 0; i < levels; ++i) g[i] = take(job.capacity[i]);
+    for (int j = 0; j < dogs; ++j) dog[j] = take(job.dog_capacity);
+
+    int max_radius = 1;
+    for (int r : job.radius) max_radius = std::max(max_radius, r);
+    const std::size_t blur_floats = RoundUp(static_cast<int>(detail::BlurRowScratchSize(ring_width, max_radius)), kPlaneAlign);
+    float* blur_scratch = ThreadScratch(kSlotRow, blur_floats + 4 * static_cast<std::size_t>(ring_width));
+    float* up_a = blur_scratch + blur_floats;  // two upsampled rows, indexed by column
+    float* up_b = up_a + 2 * ring_width;
+    std::vector<const float*> rows(2 * static_cast<std::size_t>(max_radius) + 1);
+
+    // Rows [start, end) of each level are computed; done = last row computed.
+    std::vector<int> done(levels), end(levels);
+    for (int i = 0; i < levels; ++i) {
+      done[i] = std::max(0, y0 - job.margin[i]) - 1;
+      end[i] = std::min(h, y1 + job.margin[i]);
+    }
+    int src_done = std::max(0, y0 - job.source_margin) - 1;
+    const int src_end = std::min(h, y1 + job.source_margin);
+    const int src_x0 = col_lo(job.source_margin), src_x1 = col_hi(job.source_margin);
+
+    auto source_row = [&](int y) -> const float* { return job.upsample_source ? src.row(y) : job.source.row(y); };
+
+    // Upsampled source rows: even rows are input rows upsampled along x, odd
+    // rows the average of the two neighbouring even rows (VLFeat's order).
+    auto ensure_source = [&](int y_last) {
+      if (!job.upsample_source) return;
+      y_last = std::min(y_last, src_end - 1);
+      const int hin = job.source.height, win = job.source.width;
+      const int ix0 = src_x0 / 2, ix1 = std::min(win, (src_x1 + 1) / 2);
+      while (src_done < y_last) {
+        const int y = ++src_done;
+        if (y % 2 == 0) {
+          detail::UpsampleRow(job.source.row(y / 2), win, ix0, ix1, src.row(y));
+        } else {
+          float* a = up_a - col_base;
+          float* b = up_b - col_base;
+          detail::UpsampleRow(job.source.row(y / 2), win, ix0, ix1, a);
+          detail::UpsampleRow(job.source.row(std::min(y / 2 + 1, hin - 1)), win, ix0, ix1, b);
+          const int xa = 2 * ix0 / kPlaneAlign * kPlaneAlign;  // aligned; extra columns are unused
+          detail::AverageRows(a + xa, b + xa, 2 * ix1 - xa, src.row(y) + xa);
+        }
+      }
+    };
+
+    // Computes level i up to row y_last, pulling the rows it needs from the
+    // level below first.
+    auto ensure = [&](auto&& self, int i, int y_last) -> void {
+      y_last = std::min(y_last, end[i] - 1);
+      const int r = job.radius[i];
+      const int cx0 = col_lo(job.margin[i]), cx1 = col_hi(job.margin[i]);
+      while (done[i] < y_last) {
+        const int y = done[i] + 1;
+        const int need = std::min(h - 1, y + r);
+        if (i == 0) {
+          ensure_source(need);
+        } else {
+          self(self, i - 1, need);
+        }
+        float* out_row = g[i].row(y);
+        if (r == 0) {  // level 0 without smoothing
+          std::memcpy(out_row + cx0, source_row(y) + cx0, sizeof(float) * (cx1 - cx0));
+        } else {
+          for (int j = -r; j <= r; ++j) {
+            const int yy = std::clamp(y + j, 0, h - 1);
+            rows[j + r] = i == 0 ? source_row(yy) : g[i - 1].row(yy);
+          }
+          detail::BlurRow(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, blur_scratch);
+        }
+        // The tile's own part of the levels s = 0..S-1 is kept.
+        if (i >= 1 && i <= S && !job.kept.empty() && y >= y0 && y < y1) {
+          detail::StreamRow(out_row + x0, x1 - x0, job.kept[i - 1].row(y) + x0);
+        }
+        done[i] = y;
+      }
+    };
+
+    // DoG level j is Gaussian level j + 1 minus level j, on the tile plus R
+    // columns (aligned down so that the vector loads are aligned).
+    const int dog_x0 = col_lo(R) / kPlaneAlign * kPlaneAlign, dog_x1 = col_hi(R);
+    int dog_done = std::max(0, y0 - R) - 1;
+    auto ensure_dog = [&](int y_last) {
+      y_last = std::min(y_last, h - 1);
+      while (dog_done < y_last) {
+        const int y = ++dog_done;
+        for (int j = 0; j < dogs; ++j) {
+          detail::SubtractRows(g[j + 1].row(y) + dog_x0, g[j].row(y) + dog_x0, dog_x1 - dog_x0,
+                               dog[j].row(y) + dog_x0);
+        }
+      }
+    };
+
+    std::vector<std::int32_t> xs;
+    const float* prev_rows[3];
+    const float* cur_rows[3];
+    const float* next_rows[3];
+    const int det_x0 = std::max(x0, 1), det_x1 = std::min(x1, w - 1);
+    const int next_x0 = x0 / 2, next_x1 = job.has_next ? std::min(x1 / 2, job.next_base.width) : 0;
+
+    for (int y = y0; y < y1; ++y) {
+      const int y_ahead = std::min(h - 1, y + R);
+      ensure(ensure, levels - 1, y_ahead);
+      ensure_dog(y_ahead);
+
+      // The next octave starts from level s = S - 1 (index S) downsampled.
+      if (job.has_next && y % 2 == 0 && y / 2 < job.next_base.height && next_x1 > next_x0) {
+        detail::DownsampleRow(g[S].row(y) + 2 * next_x0, next_x1 - next_x0, job.next_base.row(y / 2) + next_x0);
+      }
+
+      // Extrema on DoG levels s = 0..S-1 (index s + 1).
+      if (y >= 1 && y <= h - 2 && det_x1 > det_x0) {
+        for (int s = 0; s < S; ++s) {
+          const int j = s + 1;
+          for (int k = 0; k < 3; ++k) {
+            prev_rows[k] = dog[j - 1].row(y - 1 + k);
+            cur_rows[k] = dog[j].row(y - 1 + k);
+            next_rows[k] = dog[j + 1].row(y - 1 + k);
+          }
+          xs.clear();
+          detail::FindExtremaRow(prev_rows, cur_rows, next_rows, det_x0, det_x1, job.threshold, xs);
+          for (const int x : xs) {
+            Detection det;
+            auto at = [&](int xx, int yy, int ss) -> double { return dog[ss + 1].row(yy)[xx]; };
+            if (Refine(at, w, h, s, x, y, xper, sigma0, det)) {
+              det.cx = x;
+              det.cy = y;
+              out[s].push_back(det);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Orientation assignment (vl_sift_calc_keypoint_orientations)
+  // ------------------------------------------------------------------
+
+  int Orientations(const Plane& gauss, const Detection& k, double xper, double angles[4]) const {
+    const double x = k.x / xper, y = k.y / xper, sigma = k.sigma / xper;
+    const int w = gauss.width, h = gauss.height;
+    const int xi = static_cast<int>(x + 0.5), yi = static_cast<int>(y + 0.5);
+    if (xi < 0 || xi > w - 1 || yi < 0 || yi > h - 1) return 0;
+
+    detail::OrientationWindow win;
+    win.x = x;
+    win.y = y;
+    win.sigmaw = 1.5 * sigma;
+    win.radius = std::max(static_cast<int>(std::floor(3.0 * win.sigmaw)), 1);
+
+    float histf[kOrientationBins];
+    detail::OrientationHistogram(gauss, win, histf,
+                                 ThreadScratch(kSlotKernel, detail::OrientationScratchSize(win.radius)));
+
+    double hist[kOrientationBins];
+    for (int i = 0; i < kOrientationBins; ++i) hist[i] = histf[i];
+
+    // Smooth with a circular box filter, six times.
+    for (int iter = 0; iter < 6; ++iter) {
+      double prev = hist[kOrientationBins - 1];
+      const double first = hist[0];
+      int i = 0;
+      for (; i < kOrientationBins - 1; ++i) {
+        const double newh = (prev + hist[i] + hist[(i + 1) % kOrientationBins]) / 3.0;
+        prev = hist[i];
+        hist[i] = newh;
+      }
+      hist[i] = (prev + hist[i] + first) / 3.0;
+    }
+
+    double maxh = 0;
+    for (double v : hist) maxh = std::max(maxh, v);
+
+    int n = 0;
+    for (int i = 0; i < kOrientationBins; ++i) {
+      const double h0 = hist[i];
+      const double hm = hist[(i - 1 + kOrientationBins) % kOrientationBins];
+      const double hp = hist[(i + 1 + kOrientationBins) % kOrientationBins];
+      if (h0 > 0.8 * maxh && h0 > hm && h0 > hp) {
+        const double di = -0.5 * (hp - hm) / (hp + hm - 2 * h0);  // quadratic interpolation
+        angles[n++] = 2 * kPi * (i + di + 0.5) / kOrientationBins;
+        if (n == params.max_orientations) break;
+      }
+    }
+    return n;
+  }
+
+  // ------------------------------------------------------------------
+  // Descriptor (vl_sift_calc_keypoint_descriptor)
+  // ------------------------------------------------------------------
+
+  int DescriptorRadius(double sigma_octave) const {
+    const double sbp = params.magnification * sigma_octave + kEpsilonD;
+    return static_cast<int>(std::floor(std::sqrt(2.0) * sbp * (kNBP + 1) / 2.0 + 0.5));
+  }
+
+  void Descriptor(const Plane& gauss, const Detection& k, double angle, double xper, float* desc) const {
+    detail::DescriptorWindow win;
+    win.x = k.x / xper;
+    win.y = k.y / xper;
+    win.angle = angle;
+    win.bin_size = params.magnification * (k.sigma / xper) + kEpsilonD;
+    win.window_size = params.window_size;
+    win.radius = DescriptorRadius(k.sigma / xper);
+    detail::DescriptorHistogram(gauss, win, desc,
+                                ThreadScratch(kSlotKernel, detail::DescriptorScratchSize(win.radius)));
+
+    // Normalize, clamp at 0.2 and normalize again.
+    constexpr int n = kNBP * kNBP * kNBO;
+    auto normalize = [&]() {
+      float norm = 0;
+      for (int i = 0; i < n; ++i) norm += desc[i] * desc[i];
+      norm = std::sqrt(norm) + kEpsilonF;
+      for (int i = 0; i < n; ++i) desc[i] /= norm;
+      return norm;
+    };
+    const float norm = normalize();
+    if (params.norm_threshold != 0 && norm < params.norm_threshold) {
+      std::fill(desc, desc + n, 0.0f);
+      return;
+    }
+    for (int i = 0; i < n; ++i) desc[i] = std::min(desc[i], 0.2f);
+    normalize();
+  }
+
+  // ------------------------------------------------------------------
+  // Main loop
+  // ------------------------------------------------------------------
+
+  void Extract(const ImageView& image, Features& out) {
+    out.keypoints.clear();
+    out.descriptors.clear();
+    if (image.data == nullptr || image.width <= 0 || image.height <= 0) {
+      throw std::invalid_argument("lsift: empty image");
+    }
+
+    const int W = image.width, H = image.height;
+    const int S = params.levels_per_octave;
+    const int o_min = params.first_octave;
+    const int s_min = -1, s_max = S + 1;
+    const int levels = s_max - s_min + 1;
+
+    int num_octaves = params.num_octaves;
+    if (num_octaves < 0) {
+      num_octaves = std::max(static_cast<int>(std::floor(std::log2(std::min(W, H)))) - o_min - 3, 1);
+    }
+
+    const double sigmak = std::pow(2.0, 1.0 / S);
+    const double sigma0 = params.base_sigma * sigmak;
+    const double sigman = params.nominal_sigma;
+    const double dsigma0 = sigma0 * std::sqrt(1.0 - 1.0 / (sigmak * sigmak));
+
+    auto octave_width = [&](int o) { return o < 0 ? W << -o : W >> o; };
+    auto octave_height = [&](int o) { return o < 0 ? H << -o : H >> o; };
+    const int w0 = octave_width(o_min), h0 = octave_height(o_min);
+    if (w0 < 1 || h0 < 1) return;
+
+    const bool keep_levels = !params.upright || params.compute_descriptors;
+    input_buffer.reserve(PlaneFloats(W, H));
+    const std::size_t base_floats =
+        std::max(PlaneFloats(octave_width(o_min + 1), octave_height(o_min + 1)),
+                 o_min > 0 ? PlaneFloats(w0, h0) : std::size_t{0});
+    for (auto& b : base_buffers) b.reserve(base_floats);
+    if (keep_levels) {
+      if (level_buffers.size() < static_cast<std::size_t>(S)) level_buffers.resize(S);
+      for (auto& b : level_buffers) b.reserve(PlaneFloats(w0, h0));
+    }
+
+    // Blur kernels: level 0 smooths the source, level i > 0 the level below.
+    // They do not depend on the octave, except for level 0 of the first one.
+    std::vector<std::vector<float>> kernels(levels);
+    std::vector<int> radii(levels, 0);
+    for (int s = s_min + 1; s <= s_max; ++s) {
+      kernels[s - s_min] = GaussianKernel(dsigma0 * std::pow(sigmak, s), radii[s - s_min]);
+    }
+
+    LSIFT_PROFILER();
+    const Plane input = input_buffer.plane(W, H);
+    ForRows(H, RowGrain(W, 1 << 16), [&](int y0, int y1) { detail::ConvertRows(image, input, y0, y1); });
+
+    Plane source = input;  // level 0 of the current octave comes from here
+    bool upsample = false;
+    if (o_min < 0) {
+      // Double the image -o_min - 1 times here; the last doubling is done
+      // while streaming. The result has the size of octave o_min + 1, so it
+      // fits the base planes.
+      for (int k = 0; k < -o_min - 1; ++k) {
+        const Plane dst = base_buffers[k % 2].plane(source.width * 2, source.height * 2);
+        const std::size_t scratch = 2 * (static_cast<std::size_t>(dst.stride) + kPlaneAlign);
+        ForRows(source.height, RowGrain(dst.width * 2, 1 << 16), [&](int y0, int y1) {
+          detail::UpsampleRows(source, dst, y0, y1, ThreadScratch(kSlotRow, scratch));
+        });
+        source = dst;
+      }
+      upsample = true;
+    } else if (o_min > 0) {
+      const Plane dst = base_buffers[0].plane(w0, h0);
+      ForRows(h0, RowGrain(w0, 1 << 16), [&](int y0, int y1) { detail::DownsampleRows(input, dst, o_min, y0, y1); });
+      source = dst;
+    }
+    LSIFT_MARK("input");
+
+    std::vector<std::vector<Detection>> tile_detections;  // [tile * S + s]
+    std::vector<Tile> tiles;
+    int next_base = 0;
+
+    for (int o = o_min; o < o_min + num_octaves; ++o) {
+      const int w = octave_width(o), h = octave_height(o);
+      if (w < 1 || h < 1) break;
+      const double xper = std::pow(2.0, o);
+
+      // ---- Set up the streaming pass ----------------------------------------
+      OctaveJob job;
+      job.w = w;
+      job.h = h;
+      job.S = S;
+      job.kernel = kernels;
+      job.radius = radii;
+      {
+        // Smoothing of level 0 relative to the source.
+        double sa = sigma0 * std::pow(sigmak, s_min), sb;
+        if (o == o_min) {
+          sb = sigman * std::pow(2.0, -o_min);
+        } else {
+          const int s_best = std::min(s_min + S, s_max);
+          sb = sigma0 * std::pow(sigmak, s_best - S);
+        }
+        if (sa > sb) {
+          job.kernel[0] = GaussianKernel(std::sqrt(sa * sa - sb * sb), job.radius[0]);
+        } else {
+          job.kernel[0].clear();
+          job.radius[0] = 0;
+        }
+      }
+      job.margin.assign(levels, 0);
+      job.capacity.assign(levels, 0);
+      job.margin[levels - 1] = kRefineMargin;
+      for (int i = levels - 2; i >= 0; --i) {
+        job.margin[i] = std::max(kRefineMargin, job.margin[i + 1] + job.radius[i + 1]);
+      }
+      for (int i = 0; i < levels; ++i) {
+        const int consumer = i + 1 < levels ? 2 * job.radius[i + 1] + 1 : 0;
+        job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 2;
+      }
+      job.dog_capacity = 2 * kRefineMargin + 2;
+      job.source = source;
+      job.upsample_source = upsample;
+      job.source_margin = job.margin[0] + job.radius[0];
+      job.source_capacity = 2 * job.radius[0] + 3;
+      job.threshold = static_cast<float>(0.8 * params.peak_threshold);
+      if (keep_levels) {
+        for (int s = 0; s < S; ++s) job.kept.push_back(level_buffers[s].plane(w, h));
+      }
+      const int wn = octave_width(o + 1), hn = octave_height(o + 1);
+      job.has_next = o + 1 < o_min + num_octaves && wn >= 1 && hn >= 1;
+      if (job.has_next) {
+        // Alternate between the two base planes; the source may be one of them.
+        if (source.data == base_buffers[next_base].plane(1, 1).data) next_base ^= 1;
+        job.next_base = base_buffers[next_base].plane(wn, hn);
+      }
+
+      // Tiles: about kTileWidth columns wide, so that the rings of a tile stay
+      // small, and about two per thread, while at least twice the margin in
+      // each direction so that the recomputed rows and columns stay a small
+      // fraction. Tile columns start at multiples of 32 so that the next
+      // octave's columns start aligned.
+      int strips = 1;
+      {
+        constexpr int kTileWidth = 1024;
+        const int threads = static_cast<int>(std::max(1u, exec->concurrency()));
+        const int min_size = std::max(32, 2 * job.margin[0]);
+        const int planned = std::max(1, std::min((w + kTileWidth / 2) / kTileWidth, w / min_size));
+        const int strip_w = RoundUp((w + planned - 1) / planned, 32);
+        strips = (w + strip_w - 1) / strip_w;
+        const int wanted_bands = (2 * threads + strips - 1) / strips;
+        const int bands = std::max(1, std::min(wanted_bands, h / min_size));
+        const int band_h = (h + bands - 1) / bands;
+        tiles.clear();
+        for (int y = 0; y < h; y += band_h) {
+          for (int x = 0; x < w; x += strip_w) tiles.push_back({x, std::min(w, x + strip_w), y, std::min(h, y + band_h)});
+        }
+      }
+      tile_detections.assign(tiles.size() * S, {});
+      LSIFT_MARK("setup");
+      exec->parallel_for(tiles.size(), 1, [&](std::size_t b, std::size_t e) {
+        for (std::size_t t = b; t < e; ++t) ProcessTile(job, tiles[t], xper, sigma0, &tile_detections[t * S]);
+      });
+#ifdef LSIFT_PROFILE
+      {
+        static const char* kNames[] = {"scale o-2", "scale o-1", "scale o0", "scale o1", "scale o2", "scale o3",
+                                       "scale o4",  "scale o5",  "scale o6", "scale o7", "scale o8+"};
+        LSIFT_MARK(kNames[std::clamp(o + 2, 0, 10)]);
+      }
+#endif
+
+      if (job.has_next) source = job.next_base;
+      upsample = false;
+
+      // VLFeat lists the keypoints of an octave by level, then by the row and
+      // column where the extremum was found. Tiles are band-major and each
+      // lists a level in row-major order, so per level and band it is enough
+      // to merge the band's tiles by row; a stable sort keeps the column order.
+      std::vector<Detection> keys;
+      {
+        std::size_t total = 0;
+        for (const auto& v : tile_detections) total += v.size();
+        keys.reserve(total);
+        const std::size_t bands = tiles.size() / strips;
+        for (int s = 0; s < S; ++s) {
+          for (std::size_t b = 0; b < bands; ++b) {
+            const std::size_t start = keys.size();
+            for (int x = 0; x < strips; ++x) {
+              const auto& v = tile_detections[(b * strips + x) * S + s];
+              keys.insert(keys.end(), v.begin(), v.end());
+            }
+            if (strips > 1) {
+              std::stable_sort(keys.begin() + start, keys.end(),
+                               [](const Detection& a, const Detection& c) { return a.cy < c.cy; });
+            }
+          }
+        }
+      }
+      LSIFT_MARK("collect");
+      if (keys.empty()) continue;
+
+      // ---- Orientations ---------------------------------------------------
+      std::vector<double> angles(keys.size() * 4, 0.0);
+      std::vector<int> num_angles(keys.size(), 1);
+      if (!params.upright) {
+        exec->parallel_for(keys.size(), 16, [&](std::size_t b, std::size_t e) {
+          for (std::size_t i = b; i < e; ++i) {
+            num_angles[i] =
+                Orientations(job.kept[keys[i].is], keys[i], xper, &angles[4 * i]);
+          }
+        });
+      }
+      LSIFT_MARK("orientation");
+      std::vector<std::size_t> offset(keys.size() + 1, 0);
+      for (std::size_t i = 0; i < keys.size(); ++i) offset[i + 1] = offset[i] + num_angles[i];
+
+      const std::size_t first = out.keypoints.size();
+      const std::size_t count = offset.back();
+      out.keypoints.resize(first + count);
+      if (params.compute_descriptors) out.descriptors.resize((first + count) * kDescriptorSize);
+      for (std::size_t i = 0; i < keys.size(); ++i) {
+        for (int a = 0; a < num_angles[i]; ++a) {
+          Keypoint& kp = out.keypoints[first + offset[i] + a];
+          kp.x = static_cast<float>(keys[i].x);
+          kp.y = static_cast<float>(keys[i].y);
+          kp.sigma = static_cast<float>(keys[i].sigma);
+          kp.angle = static_cast<float>(angles[4 * i + a]);
+          kp.response = keys[i].response;
+          kp.octave = o;
+          kp.level = static_cast<float>(keys[i].s);
+        }
+      }
+
+      LSIFT_MARK("output");
+      // ---- Descriptors ----------------------------------------------------
+      if (params.compute_descriptors) {
+        exec->parallel_for(count, 8, [&](std::size_t b, std::size_t e) {
+          // Map output index -> keypoint by binary search on the offsets.
+          std::size_t i = static_cast<std::size_t>(std::upper_bound(offset.begin(), offset.end(), b) - offset.begin()) - 1;
+          for (std::size_t j = b; j < e; ++j) {
+            while (offset[i + 1] <= j) ++i;
+            const Detection& k = keys[i];
+            Descriptor(job.kept[k.is], k, angles[4 * i + (j - offset[i])], xper,
+                       out.descriptors.data() + (first + j) * kDescriptorSize);
+          }
+        });
+      }
+      LSIFT_MARK("descriptor");
+    }
+  }
+};
+
+Sift::Sift(const Params& params, Executor* executor) : impl_(std::make_unique<Impl>(params, executor)) {}
+Sift::~Sift() = default;
+Sift::Sift(Sift&&) noexcept = default;
+Sift& Sift::operator=(Sift&&) noexcept = default;
+
+Features Sift::extract(const ImageView& image) {
+  Features f;
+  impl_->Extract(image, f);
+  return f;
+}
+
+void Sift::extract(const ImageView& image, Features& out) { impl_->Extract(image, out); }
+
+const Params& Sift::params() const noexcept { return impl_->params; }
+
+}  // namespace lsift
