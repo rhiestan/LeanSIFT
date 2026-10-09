@@ -126,7 +126,7 @@ vectors can run past the ends of rows without masking.
 The orientations and descriptors of octave o and the scale space of octave o + 1 do
 not depend on each other, so they run in the same parallel job: the tiles of octave
 o + 1 first (they are the larger items), then chunks of eight keypoints of octave o,
-each computing orientations and then descriptors. The gradients' Gaussian levels are
+each computing orientations and then descriptors. The kept Gaussian levels are
 double-buffered between even and odd octaves for this. The output is assembled once
 at the end, in parallel.
 
