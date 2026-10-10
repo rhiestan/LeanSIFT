@@ -35,6 +35,40 @@ have a LeanSift keypoint within 0.05 pixels (of their octave), 0.7 % in scale an
 (unit vectors) is 0.0003. Run `lsift_bench` to reproduce these numbers on your
 machine.
 
+### Comparison with other implementations
+
+The same machine and compiler as above, median of 7 runs (3 for CMLA and VLFeat on
+one thread). Every implementation uses the same settings: image doubled first,
+3 levels per octave, peak threshold 0.04 / 3 (the default of OpenCV and libsiftfast,
+so there are fewer features than in the table above) and edge threshold 10. Each call
+creates a new extractor. OpenCV 4.14.0 uses its AVX2 dispatch and OpenMP,
+[libsiftfast](https://sourceforge.net/projects/libsift/) uses SSE3 and OpenMP, and
+the [CMLA SIFT](https://github.com/cmla/sift) SIMD version uses AVX2 on one thread.
+Times in milliseconds, 1 thread / 16 threads:
+
+| image | LeanSift | OpenCV 4.14 | libsiftfast | CMLA (AVX2) | VLFeat |
+|---|---|---|---|---|---|
+| box.pgm | **10.9 / 3.0** | 17.0 / 9.2 | 43.2 / 32.1 | 41.0 / – | 99.1 / – |
+| roofs1.jpg | **53.5 / 11.7** | 97.8 / 31.5 | 202 / 126 | 221 / – | 359 / – |
+| graf1.png | **61.0 / 12.3** | 113 / 45.6 | 267 / 126 | 247 / – | 338 / – |
+| river1.jpg | **135 / 26.8** | 280 / 83.0 | 529 / 250 | 566 / – | 883 / – |
+| 12 MP mosaic | **1935 / 332** | 3327 / 1285 | 7500 / 3541 | 7837 / – | 10918 / – |
+
+LeanSift is 1.6 to 2.1 times faster than OpenCV on one thread and 2.7 to 3.9 times
+faster on 16 threads.
+
+Matching quality on river1.jpg against a copy rotated by 25° and scaled by 0.75
+(nearest neighbour, ratio test 0.8; a match is correct if it lies within 3 pixels of
+the true position):
+
+| | LeanSift | OpenCV 4.14 | libsiftfast | CMLA (AVX2) | VLFeat |
+|---|---|---|---|---|---|
+| correct matches | 4445 | 3558 | 4416 | 4238 | 4472 |
+| precision | 0.991 | 0.985 | 0.992 | 0.989 | 0.991 |
+
+The comparison program is not part of this repository because libsiftfast is LGPL and
+the CMLA code is GPL.
+
 ## Usage
 
 ```cpp
