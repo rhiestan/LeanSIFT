@@ -35,6 +35,10 @@ else()
     GIT_TAG 1.4.0
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(hwy)
+  # Treat Highway's headers as system headers, so that our warning flags
+  # (-Wpedantic) do not apply to them.
+  get_target_property(_lsift_hwy_includes hwy INTERFACE_INCLUDE_DIRECTORIES)
+  set_target_properties(hwy PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_lsift_hwy_includes}")
   if(NOT TARGET hwy::hwy)
     add_library(hwy::hwy ALIAS hwy)
   endif()

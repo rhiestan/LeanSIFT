@@ -1,7 +1,7 @@
 add_executable(lsift_cli lsift_cli.cpp)
 set_target_properties(lsift_cli PROPERTIES OUTPUT_NAME lsift)
 target_link_libraries(lsift_cli PRIVATE LeanSift::lsift lsift_support)
-if(MSVC)
+if(WIN32)
   target_compile_definitions(lsift_cli PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
