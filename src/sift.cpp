@@ -65,14 +65,19 @@ std::size_t PlaneFloats(int width, int height) {
   return static_cast<std::size_t>(StrideFor(width)) * static_cast<std::size_t>(std::max(height, 1));
 }
 
-// Zero-initialized storage for one plane with guards on both sides.
+// Storage for one plane with guards on both sides. Only the guards are
+// cleared: every value a kernel uses is written first, and vectors that run
+// into padding only produce lanes that are masked out or overwritten.
+// Clearing whole planes (up to a gigabyte for large images) would cost more
+// than some extractions.
 class PlaneBuffer {
 public:
   void reserve(std::size_t floats) {
     if (floats <= capacity_) return;
     mem_ = hwy::AllocateAligned<float>(floats + 2 * kPlaneGuard);
     if (!mem_) throw std::bad_alloc();
-    std::fill(mem_.get(), mem_.get() + floats + 2 * kPlaneGuard, 0.0f);
+    std::fill(mem_.get(), mem_.get() + kPlaneGuard, 0.0f);
+    std::fill(mem_.get() + kPlaneGuard + floats, mem_.get() + floats + 2 * kPlaneGuard, 0.0f);
     capacity_ = floats;
   }
   Plane plane(int width, int height) const {
