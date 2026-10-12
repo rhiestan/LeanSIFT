@@ -3,7 +3,10 @@
 //
 // lsift_bench: compares LeanSift with VLFeat on speed and agreement.
 //
-//   lsift_bench [--repeat N] [--threads N] [--first-octave N] [--no-vlfeat] [--no-single] image...
+//   lsift_bench [--repeat N] [--threads N] [--first-octave N] [--peak T] [--u8] [--no-vlfeat] [--no-single]
+//               image...
+//
+// --u8 passes 8-bit images to LeanSift instead of float images.
 //
 // All images are first timed with N threads, then with one thread, then with
 // VLFeat: long single-threaded runs can leave the CPU in a state where the
@@ -45,6 +48,12 @@ struct Image {
   std::string name;
   int width = 0, height = 0;
   std::vector<float> pixels;
+  std::vector<std::uint8_t> pixels_u8;
+
+  lsift::ImageView view(bool u8) const {
+    return u8 ? lsift::ImageView::gray8(pixels_u8.data(), width, height)
+              : lsift::ImageView::gray32f(pixels.data(), width, height);
+  }
   lsift::Features features;
   Timing multi, single, vlfeat;
   std::string agreement = "-";
@@ -57,6 +66,7 @@ int main(int argc, char** argv) {
   unsigned threads = 0;
   bool skip_vlfeat = false;
   bool skip_single = false;
+  bool u8 = false;
   lsift::Params params;
   std::vector<std::string> paths;
   for (int i = 1; i < argc; ++i) {
@@ -64,14 +74,16 @@ int main(int argc, char** argv) {
     if (a == "--repeat" && i + 1 < argc) repeat = std::max(1, std::atoi(argv[++i]));
     else if (a == "--threads" && i + 1 < argc) threads = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (a == "--first-octave" && i + 1 < argc) params.first_octave = std::atoi(argv[++i]);
+    else if (a == "--peak" && i + 1 < argc) params.peak_threshold = std::atof(argv[++i]);
+    else if (a == "--u8") u8 = true;
     else if (a == "--no-vlfeat") skip_vlfeat = true;
     else if (a == "--no-single") skip_single = true;
     else paths.push_back(a);
   }
   if (paths.empty()) {
     std::fprintf(stderr,
-                 "usage: lsift_bench [--repeat N] [--threads N] [--first-octave N] [--no-vlfeat] [--no-single] "
-                 "image...\n");
+                 "usage: lsift_bench [--repeat N] [--threads N] [--first-octave N] [--peak T] [--u8] [--no-vlfeat] "
+                 "[--no-single] image...\n");
     return 2;
   }
 
@@ -84,6 +96,7 @@ int main(int argc, char** argv) {
       img.width = g.width;
       img.height = g.height;
       img.pixels = g.to_float();
+      img.pixels_u8 = g.pixels;
       images.push_back(std::move(img));
     } catch (const std::exception& e) {
       std::fprintf(stderr, "%s: %s\n", path.c_str(), e.what());
@@ -92,7 +105,7 @@ int main(int argc, char** argv) {
 
   lsift::ThreadPool pool(threads);
   for (Image& img : images) {
-    const auto view = lsift::ImageView::gray32f(img.pixels.data(), img.width, img.height);
+    const auto view = img.view(u8);
     lsift::Sift sift(params, &pool);
     sift.extract(view, img.features);  // warm-up: allocations, thread start
     img.multi = Time(repeat, [&] { sift.extract(view, img.features); });
@@ -100,7 +113,7 @@ int main(int argc, char** argv) {
   if (!skip_single) {
     lsift::SerialExecutor serial;
     for (Image& img : images) {
-      const auto view = lsift::ImageView::gray32f(img.pixels.data(), img.width, img.height);
+      const auto view = img.view(u8);
       lsift::Sift sift(params, &serial);
       lsift::Features f;
       sift.extract(view, f);

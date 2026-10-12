@@ -74,6 +74,29 @@ TEST(Sift, ReuseAcrossImageSizes) {
   ExpectIdentical(b1, lsift::Sift().extract(box_view));
 }
 
+TEST(Sift, ReusedOutputIsOverwritten) {
+  const auto box = lsift::test::TestImage("box.pgm");
+  const auto roofs = lsift::test::TestImage("roofs1.jpg");
+  const auto box_view = lsift::ImageView::gray8(box.pixels.data(), box.width, box.height);
+  const auto roofs_view = lsift::ImageView::gray8(roofs.pixels.data(), roofs.width, roofs.height);
+  lsift::Sift sift;
+  lsift::Features out;
+  sift.extract(roofs_view, out);
+  sift.extract(box_view, out);  // fewer features than before
+  ExpectIdentical(out, lsift::Sift().extract(box_view));
+  sift.extract(roofs_view, out);  // more
+  ExpectIdentical(out, lsift::Sift().extract(roofs_view));
+
+  lsift::Params p;
+  p.compute_descriptors = false;
+  lsift::Sift(p).extract(box_view, out);
+  EXPECT_EQ(out.size(), lsift::Sift().extract(box_view).size());
+  EXPECT_TRUE(out.descriptors.empty());
+
+  EXPECT_THROW(sift.extract(lsift::ImageView::gray8(nullptr, 0, 0), out), std::invalid_argument);
+  EXPECT_EQ(out.size(), 0u);
+}
+
 TEST(Sift, KeypointsWithoutDescriptors) {
   const auto& img = lsift::test::TestImage("box.pgm");
   const auto view = lsift::ImageView::gray8(img.pixels.data(), img.width, img.height);

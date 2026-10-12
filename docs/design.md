@@ -49,24 +49,35 @@ LeanSift's design follows from that.
 
 ### Streaming scale space (tiles and ring buffers)
 
-An octave is processed in one pass per tile. A tile is about 1024 columns wide and
-tall enough to give each thread about two tiles. For each tile, the pipeline keeps:
+An octave is processed in one pass per tile. For each tile, the pipeline keeps:
 
 - one ring buffer of rows per Gaussian level, holding only the rows still needed by
-  the next level's blur and by the detector;
-- ring buffers of DoG rows around the current detection row.
+  the next level's blur, the detector and the refinement;
+- small ring buffers of DoG rows: the detection rows of the current step and one more
+  on each side.
 
-Rows are produced on demand, two at a time: detecting extrema on row y needs every
-level up to row y + 7 (the detector's 3x3x3 neighbourhood plus the refinement, which can move a
-keypoint by up to four pixels), which pulls the rows each level needs from the level
-below, down to the (optionally doubled) input. The doubling itself is also done row by
-row. While the rows are in cache the pass also
+Rows are produced on demand, four at a time: detecting extrema on rows y .. y + 3 needs
+every level up to row y + 3 + 7 (the detector's 3x3x3 neighbourhood plus the
+refinement, which can move a keypoint by up to four pixels), which pulls the rows each
+level needs from the level below, down to the (optionally doubled) input. The doubling
+itself is also done row by row; with the default first octave, 8-bit input rows are
+converted to float there, and float input is read in place, so the input image is never
+copied. While the rows are in cache the pass also
 
 - subtracts adjacent levels into the DoG rings,
-- finds the extrema and refines them (the refinement reads the DoG rings),
+- finds the extrema and refines them (the refinement reads differences of the Gaussian
+  rings, which hold the rows it needs anyway, so the DoG rings stay small),
 - writes the next octave's base image (level S - 1 subsampled),
 - copies the tile's part of levels s = 0..S-1 to full-size planes with non-temporal
   stores; orientations and descriptors read these later.
+
+Tiles are as wide as fits a cache budget of 640 KB for the rings of all levels (about
+400 columns with the default parameters, a little more than a core's 512 KB L2 on Zen 3)
+and tall enough to give each thread about two tiles. The budget matters with many
+threads: with 1024-column tiles (1.6 MB of rings) the rings spill to the L3 cache,
+which all cores share, and a tile took twice as long with 16 threads as with one; the
+narrower tiles made the 12 MP image about 20 % faster on 16 threads, although they
+recompute more margin columns (about 2 % slower on one thread).
 
 Tiles overlap: each level is computed for the tile plus a margin (the sum of the blur
 radii above it plus the refinement margin, about 50 pixels at the base level with the
@@ -109,10 +120,12 @@ best at run time. Highlights:
 - **Gaussian blur:** separable, using the kernel's symmetry (one multiply per pair of
   taps), several vectors per step to amortise loads of row pointers and
   coefficients, and replicated borders written into a padded row so the inner loops
-  have no checks. The vertical pass computes two output rows at once: with
-  L_j = in[y - j] and R_j = in[y + 1 + j], out[y] = sum k_j (L_j + R_{j-1}) and
-  out[y + 1] = sum k_j (L_{j-1} + R_j), so each input row is loaded once for both,
-  which halves the cache traffic of the pass.
+  have no checks. The vertical pass computes four output rows at once, keeping a
+  sliding window of input rows in registers, so each input row is loaded once for all
+  four. The pass is limited by the traffic from L2 (2 r + 4 rows per four output
+  rows); this is about 10 % faster than two rows at once. All variants (one, two and
+  four rows) add the terms in the same order, so results do not depend on how rows are
+  grouped.
 - **Extrema:** vectors of 8 or 16 pixels are compared against the threshold first,
   then against the 8 neighbours on their level, then the 9 on each adjacent level,
   leaving early when no lane can still be an extremum.
@@ -127,8 +140,10 @@ The orientations and descriptors of octave o and the scale space of octave o + 1
 not depend on each other, so they run in the same parallel job: the tiles of octave
 o + 1 first (they are the larger items), then chunks of eight keypoints of octave o,
 each computing orientations and then descriptors. The kept Gaussian levels are
-double-buffered between even and odd octaves for this. The output is assembled once
-at the end, in parallel.
+double-buffered between even and odd octaves for this. The detections of the tiles of
+an octave are merged in parallel (one counting sort by row per level and band). The
+output is assembled once at the end, in parallel and with non-temporal stores; a
+reused `Features` is only resized, so its memory is not cleared again.
 
 ### Threads
 
@@ -172,6 +187,25 @@ full-size DoG or intermediate images, working set per tile in the low megabytes)
 dynamic scheduling of keypoints, padding to avoid false sharing, and fine-grained
 tasks for detection (tiles rather than scales).
 
+## Profile
+
+Measured with AMD uProf (hardware counters) on the 12 MP image, default parameters:
+
+- One thread: descriptors take about 60 % of the cycles, the blur about 17 %,
+  orientations about 9 % and extrema about 5 %. All are compute-bound (about 2.2
+  instructions per cycle, L1 miss rates of 1-2 % except in the blur, almost no demand
+  misses to DRAM).
+- 16 threads: the same work takes more cycles per instruction, mostly in the
+  scale-space tiles, whose rings competed for the shared L3 cache (see the tile
+  budget above); the lower all-core clock accounts for about 1.2x. Load balance is
+  good (95-99 % busy within each parallel phase); the serial steps between phases now
+  take about 2 ms in total.
+- Creating a new `lsift::Sift` for every image costs much more than the extraction
+  itself for large images: its buffers (about 900 MB for 12 MP with the default
+  first octave -1) are fresh memory, which the operating system has to zero on first
+  touch. On this machine a new extractor per 12 MP image takes about 320 ms on 16
+  threads instead of 170 ms with a reused one (peak threshold 0.04 / 3).
+
 ## Experiments that did not pay off
 
 - Storing gradients (half-float magnitude, 16-bit angle) computed once per pixel in
@@ -182,12 +216,20 @@ tasks for detection (tiles rather than scales).
   balance saves.
 - Keeping the descriptor accumulators in a separate, non-inlined function to avoid a
   register spill: the spill went away but the loop did not get faster.
+- Separate sums for even and odd taps in the four-row vertical blur (twice as many
+  independent FMA chains): no gain, the pass is limited by loads from L2.
 
 On this CPU, multi-threaded efficiency is limited by the lower all-core clock and by
-memory traffic (16 threads reach about 8x the single-threaded speed).
+the shared caches (16 threads reach about 10x the single-threaded speed).
 
 ## Possible next steps
 
+- Keep only a window of rows of the kept levels instead of whole octaves: process the
+  keypoints of a band of rows as soon as the bands around it are complete, with tiles
+  that continue down their column strip instead of recomputing vertical margins. This
+  would cut the memory of an extraction from about 900 MB to about 150 MB for 12 MP
+  (fewer page faults for a new extractor) and let descriptors read the levels from L3
+  instead of DRAM, at the cost of a more complex schedule.
 - Descriptors are now the largest cost (about 60 % on one thread, about 22 cycles per
   sample). A different accumulation scheme would be needed for a large gain.
 - 8-float register accumulation for 128-bit targets (two vectors per cell) for NEON.
