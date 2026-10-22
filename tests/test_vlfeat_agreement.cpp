@@ -6,6 +6,7 @@
 // tolerance) and nearly identical descriptors.
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
 #include "compare.h"

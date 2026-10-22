@@ -3,10 +3,11 @@
 //
 // lsift_microbench: throughput of individual kernels (development aid).
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <string>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 #include "hwy/aligned_allocator.h"

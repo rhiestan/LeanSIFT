@@ -4,6 +4,7 @@
 // Every SIMD target compiled into the library and supported by this CPU must
 // agree with VLFeat, not only the one chosen at run time.
 
+#include <cstdio>
 #include <string>
 #include <vector>
 

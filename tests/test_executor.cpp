@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <thread>
 #include <vector>

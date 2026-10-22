@@ -35,6 +35,14 @@ else()
 endif()
 target_include_directories(vlfeat SYSTEM PUBLIC ${vlfeat_SOURCE_DIR})
 target_compile_definitions(vlfeat PUBLIC VL_DISABLE_AVX VL_DISABLE_THREADS VL_DISABLE_OPENMP)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86)$")
+  # VLFeat's SSE2 code is x86 only. Elsewhere it takes the byte order from
+  # __LITTLE_ENDIAN__, which Clang defines but GCC does not.
+  target_compile_definitions(vlfeat PUBLIC VL_DISABLE_SSE2)
+  if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_BYTE_ORDER STREQUAL "LITTLE_ENDIAN")
+    target_compile_definitions(vlfeat PUBLIC __LITTLE_ENDIAN__)
+  endif()
+endif()
 if(MSVC)
   target_compile_options(vlfeat PRIVATE /W0)
   # MSVC targets SSE2 on x64 without defining __SSE2__, which VLFeat checks.

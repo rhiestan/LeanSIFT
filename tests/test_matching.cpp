@@ -5,6 +5,7 @@
 // homography. LeanSift must match as well as VLFeat.
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include "compare.h"

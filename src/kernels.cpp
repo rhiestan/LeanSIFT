@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "hwy/cache_control.h"
 #include "hwy/highway.h"

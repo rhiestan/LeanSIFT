@@ -8,11 +8,13 @@
 // The output has one line per feature: x y sigma angle followed by the 128
 // descriptor values as bytes (VLFeat's 512 * d, clamped to 255).
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "image_io.h"
