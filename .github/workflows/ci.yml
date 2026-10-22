@@ -85,4 +85,14 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --parallel 4
+        run: ctest --test-dir build --output-on-failure --parallel 4 --exclude-regex '^Targets\.'
+
+      # The tests of the SIMD targets, with their output; the targets tested and
+      # not tested are also shown as an annotation on the run's summary page.
+      - name: Test the SIMD targets
+        run: |
+          ctest --test-dir build --output-on-failure --parallel 4 --tests-regex '^Targets\.' -V | tee targets.log
+          grep -oE '\[ [A-Z0-9_]+ +\] ref ' targets.log | awk '{print $2}' | sort -u > tested.txt
+          grep -oE '\[ [A-Z0-9_]+ +\] not tested' targets.log | awk '{print $2}' | sort -u > untested.txt
+          echo "::notice title=SIMD targets::tested: $(paste -sd ' ' - < tested.txt);" \
+               "not tested: $(comm -13 tested.txt untested.txt | paste -sd ' ' -)"
