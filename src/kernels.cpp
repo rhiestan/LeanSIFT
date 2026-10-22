@@ -693,6 +693,14 @@ struct RowSamples {
   float* s11;
 };
 
+// std::swap does not accept SVE vectors (sizeless types) with libstdc++.
+template <class V>
+HWY_INLINE void SwapVec(V& a, V& b) {
+  const V t = a;
+  a = b;
+  b = t;
+}
+
 // Accumulates the n samples of one row into `cells` (phase 2).
 HWY_INLINE void AccumulateRow(DO dO, const RowSamples& r, int n, float* HWY_RESTRICT cells, int& cur_cell,
                               hn::Vec<DO>& a00, hn::Vec<DO>& a01, hn::Vec<DO>& a10, hn::Vec<DO>& a11,
@@ -712,10 +720,10 @@ HWY_INLINE void AccumulateRow(DO dO, const RowSamples& r, int n, float* HWY_REST
       a10 = hn::MulAdd(t, hn::Set(dO, r.s10[o]), a10);
       a11 = hn::MulAdd(t, hn::Set(dO, r.s11[o]), a11);
       // The next sample uses the other set of accumulators.
-      std::swap(a00, b00);
-      std::swap(a01, b01);
-      std::swap(a10, b10);
-      std::swap(a11, b11);
+      SwapVec(a00, b00);
+      SwapVec(a01, b01);
+      SwapVec(a10, b10);
+      SwapVec(a11, b11);
     } else {
       float* p = cells + cell * kNBO;
       const float w0 = r.w0[o], w1 = r.w1[o];
