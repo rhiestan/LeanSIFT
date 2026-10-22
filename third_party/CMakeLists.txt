@@ -1,25 +1,18 @@
 # Dependencies used only by the tools, tests and benchmarks. The library itself
 # depends on Google Highway alone.
 
-# stb_image (public domain / MIT) for reading test images.
-FetchContent_Declare(stb
-  GIT_REPOSITORY https://github.com/nothings/stb.git
-  GIT_TAG 2c980bb59875b0d32144a71867fbdebb2f77cd20)
-FetchContent_MakeAvailable(stb)
+# stb_image (public domain / MIT) for reading test images: stb/stb_image.h is an
+# unmodified copy from https://github.com/nothings/stb at commit
+# 2c980bb59875b0d32144a71867fbdebb2f77cd20.
 add_library(lsift_stb INTERFACE)
-target_include_directories(lsift_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
+target_include_directories(lsift_stb SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/stb)
 
 # VLFeat (BSD-2-Clause), the reference implementation LeanSift is compared against.
 if(LSIFT_VLFEAT_SOURCE_DIR)
   set(vlfeat_SOURCE_DIR ${LSIFT_VLFEAT_SOURCE_DIR})
 else()
-  FetchContent_Declare(vlfeat
-    GIT_REPOSITORY https://github.com/vlfeat/vlfeat.git
-    GIT_TAG 1b9075fc42fe54b42f0e937f8b9a230d8e2c7701)
-  FetchContent_GetProperties(vlfeat)
-  if(NOT vlfeat_POPULATED)
-    FetchContent_Populate(vlfeat)
-  endif()
+  lsift_require_submodule(third_party/vlfeat vl/sift.c)
+  set(vlfeat_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vlfeat)
 endif()
 
 enable_language(C)

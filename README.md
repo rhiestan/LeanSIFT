@@ -125,17 +125,23 @@ keypoint with several orientations appears once per orientation.
 ## Building
 
 Requires CMake 3.21 and a C++17 compiler (tested with MSVC 2022 and clang-cl 22).
-Highway is fetched automatically (or use `-DLSIFT_USE_SYSTEM_HWY=ON`).
+Highway, VLFeat (the reference) and GoogleTest are git submodules, so clone with
+`--recursive` (or run `git submodule update --init --recursive` in an existing clone);
+the build needs no network access. `-DLSIFT_USE_SYSTEM_HWY=ON` uses an installed
+Highway instead.
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+git clone --recursive https://github.com/rhiestan/LeanSIFT.git LeanSift
+cmake -S LeanSift -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build
 ```
 
-The tests and tools also fetch VLFeat (the reference), GoogleTest and stb_image;
-`-DLSIFT_VLFEAT_SOURCE_DIR=path` uses a local VLFeat checkout instead. Turn them off
-with `-DLSIFT_BUILD_TESTS=OFF -DLSIFT_BUILD_TOOLS=OFF` to build only the library.
+Only the tests and tools use VLFeat, GoogleTest and stb_image (which is included in
+`third_party/stb`); `-DLSIFT_VLFEAT_SOURCE_DIR=path` uses another VLFeat checkout.
+Turn them off with `-DLSIFT_BUILD_TESTS=OFF -DLSIFT_BUILD_TOOLS=OFF` to build only
+the library. A project that adds LeanSift with `FetchContent` and only needs the
+library can skip the other submodules with `GIT_SUBMODULES "third_party/highway"`.
 Clang (or clang-cl on Windows) usually gives the fastest code.
 
 After `cmake --install`, use the library with `find_package(LeanSift)` and

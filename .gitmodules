@@ -1,0 +1,12 @@
+[submodule "third_party/highway"]
+	path = third_party/highway
+	url = https://github.com/google/highway.git
+	shallow = true
+[submodule "third_party/googletest"]
+	path = third_party/googletest
+	url = https://github.com/google/googletest.git
+	shallow = true
+[submodule "third_party/vlfeat"]
+	path = third_party/vlfeat
+	url = https://github.com/vlfeat/vlfeat.git
+	shallow = true
