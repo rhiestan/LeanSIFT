@@ -1,5 +1,7 @@
 # LeanSift
 
+[![CI](https://github.com/rhiestan/LeanSIFT/actions/workflows/ci.yml/badge.svg)](https://github.com/rhiestan/LeanSIFT/actions/workflows/ci.yml)
+
 Fast SIFT feature extraction for CPUs, compatible with [VLFeat](https://www.vlfeat.org/)'s
 SIFT. LeanSift computes the same keypoints and descriptors as VLFeat (up to
 floating-point differences) and uses SIMD on every stage and all CPU cores.
@@ -8,8 +10,8 @@ floating-point differences) and uses SIMD on every stage and all CPU cores.
   descriptor as VLFeat's `vl_sift`, with the same parameters, coordinate conventions
   and output order. Tested against VLFeat on every build.
 - **Fast:** portable SIMD through [Google Highway](https://github.com/google/highway)
-  (SSE4, AVX2, AVX-512, NEON, ...; the best version is chosen at run time; so far
-  tested on AVX2),
+  (SSE4, AVX2, AVX-512, NEON, SVE, ...; the best version is chosen at run time;
+  tested on x86-64 and ARM64),
   a cache-friendly streaming scale space and multi-threading.
 - **Lean:** C++17, one dependency (Highway), BSD-2-Clause licence.
 
@@ -124,7 +126,10 @@ keypoint with several orientations appears once per orientation.
 
 ## Building
 
-Requires CMake 3.21 and a C++17 compiler (tested with MSVC 2022 and clang-cl 22).
+Requires CMake 3.21 and a C++17 compiler. Continuous integration builds and tests
+LeanSift with clang-cl on Windows x64, GCC on Linux x64 and ARM64, and Apple Clang
+on macOS ARM64; MSVC 2022 and clang-cl 22 are tested locally.
+
 Highway and VLFeat (the reference) are git submodules, so clone with
 `--recursive` (or run `git submodule update --init --recursive` in an existing clone);
 the build needs no network access. `-DLSIFT_USE_SYSTEM_HWY=ON` uses an installed
