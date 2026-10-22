@@ -149,6 +149,13 @@ the library. A project that adds LeanSift with `FetchContent` and only needs the
 library can skip VLFeat with `GIT_SUBMODULES "third_party/highway"`.
 Clang (or clang-cl on Windows) usually gives the fastest code.
 
+The tests compare every SIMD target the CPU supports with VLFeat (e.g. SSE2 to AVX2
+on an AVX2 CPU). To also test the targets it lacks, pass an emulator:
+`-DLSIFT_SDE=path/to/sde64` (or `sde.exe`) runs the test under
+[Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html)
+for the AVX-512 targets, and `-DLSIFT_QEMU=path/to/qemu-aarch64` runs it under QEMU
+with 128-, 256- and 512-bit SVE on ARM64. The CI does both.
+
 After `cmake --install`, use the library with `find_package(LeanSift)` and
 `target_link_libraries(app PRIVATE LeanSift::lsift)`.
 

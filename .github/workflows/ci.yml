@@ -1,3 +1,6 @@
+# Builds LeanSift and runs its tests on Windows, Linux (x86-64 and ARM64) and
+# macOS. Three jobs also test the SIMD targets their CPU lacks in an emulator:
+# the AVX-512 targets in Intel SDE, the SVE targets in QEMU.
 name: CI
 
 on:
@@ -19,20 +22,27 @@ jobs:
     # only need it when they come from a fork.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Windows x64 (clang-cl)
+          - name: Windows x64 (clang-cl, with SDE)
             os: windows-2025
             cmake_args: -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-          - name: Linux x64 (GCC)
+            sde: true
+          - name: Linux x64 (GCC, with SDE)
             os: ubuntu-24.04
-          - name: Linux ARM64 (GCC)
+            sde: true
+          - name: Linux ARM64 (GCC, with QEMU)
             os: ubuntu-24.04-arm
+            qemu: true
           - name: macOS ARM64 (Apple Clang)
             os: macos-15
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v5
@@ -44,8 +54,32 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Set up Intel SDE
+        if: matrix.sde
+        uses: petarpetrovt/setup-sde@v6.0
+
+      - name: Install QEMU
+        if: matrix.qemu
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user
+
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+        run: |
+          args=()
+          if [ -n "${SDE_PATH:-}" ]; then
+            if [ "$RUNNER_OS" = Windows ]; then
+              args+=(-DLSIFT_SDE="$(cygpath -m "$SDE_PATH")/sde.exe")
+            else
+              args+=(-DLSIFT_SDE="$SDE_PATH/sde64")
+              # SDE attaches to the program it runs.
+              sudo sysctl -w kernel.yama.ptrace_scope=0
+            fi
+          fi
+          if [ "${{ matrix.qemu }}" = true ]; then
+            args+=(-DLSIFT_QEMU="$(command -v qemu-aarch64)")
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }} "${args[@]}"
 
       - name: Build
         run: cmake --build build --parallel 4
