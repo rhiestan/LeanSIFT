@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "compare.h"
-#include "gtest/gtest.h"
+#include "doctest.h"
 #include "lsift/lsift.hpp"
 #include "test_util.h"
 #include "vlfeat_ref.h"
@@ -39,7 +39,7 @@ std::vector<float> Warp(const std::vector<float>& src, int w, int h, const lsift
   return dst;
 }
 
-TEST(Matching, RotatedAndScaledCopy) {
+TEST_CASE("Matching.RotatedAndScaledCopy") {
   const auto& img = lsift::test::TestImage("roofs1.jpg");
   const int w = img.width, h = img.height;
   const std::vector<float> a = img.to_float();
@@ -62,9 +62,9 @@ TEST(Matching, RotatedAndScaledCopy) {
   const lsift::support::MatchingResult theirs = lsift::support::MatchWithHomography(ra, rb, H);
   std::printf("[ LeanSift ] %s\n[ VLFeat   ] %s\n", ours.summary().c_str(), theirs.summary().c_str());
 
-  ASSERT_GT(theirs.correct, 100u);
-  EXPECT_GE(ours.correct, 0.98 * theirs.correct);
-  EXPECT_GE(ours.precision(), theirs.precision() - 0.01);
+  REQUIRE(theirs.correct > 100u);
+  CHECK(ours.correct >= 0.98 * theirs.correct);
+  CHECK(ours.precision() >= theirs.precision() - 0.01);
 }
 
 }  // namespace

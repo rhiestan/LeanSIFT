@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "compare.h"
-#include "gtest/gtest.h"
+#include "doctest.h"
 #include "hwy/targets.h"
 #include "lsift/lsift.hpp"
 #include "test_util.h"
@@ -16,7 +16,7 @@
 
 namespace {
 
-TEST(Targets, EveryTargetAgreesWithVLFeat) {
+TEST_CASE("Targets.EveryTargetAgreesWithVLFeat") {
   const auto& img = lsift::test::TestImage("roofs1.jpg");
   const std::vector<float> fimg = img.to_float();
   const lsift::Params params;
@@ -26,18 +26,19 @@ TEST(Targets, EveryTargetAgreesWithVLFeat) {
   for (const std::int64_t target : hwy::SupportedAndGeneratedTargets()) {
     hwy::SetSupportedTargetsForTest(target);
     const std::string name = lsift::simd_target_name();
+    INFO(name);
     lsift::SerialExecutor serial;
     const lsift::Features test =
         lsift::Sift(params, &serial).extract(lsift::ImageView::gray32f(fimg.data(), img.width, img.height));
     const lsift::support::Agreement a = lsift::support::CompareFeatures(ref, test);
     std::printf("[ %-9s ] %s\n", name.c_str(), a.summary().c_str());
-    EXPECT_GE(a.recall(), 0.99) << name;
-    EXPECT_GE(a.precision(), 0.99) << name;
-    EXPECT_LE(a.p99_descriptor_distance, 0.01) << name;
+    CHECK(a.recall() >= 0.99);
+    CHECK(a.precision() >= 0.99);
+    CHECK(a.p99_descriptor_distance <= 0.01);
     ++tested;
   }
   hwy::SetSupportedTargetsForTest(0);  // back to the best target
-  EXPECT_GT(tested, 0);
+  CHECK(tested > 0);
 }
 
 }  // namespace
