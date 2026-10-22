@@ -15,16 +15,34 @@ else()
   set(vlfeat_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vlfeat)
 endif()
 
+# On Linux, vl/host.h pins memcpy to the symbol version GLIBC_2.2.5, which
+# exists only on x86-64. Elsewhere, build from a copy of vl/ without that line.
+set(vlfeat_code_dir ${vlfeat_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(vlfeat_code_dir ${CMAKE_CURRENT_BINARY_DIR}/vlfeat)
+  file(COPY ${vlfeat_SOURCE_DIR}/vl DESTINATION ${vlfeat_code_dir} PATTERN host.h EXCLUDE)
+  file(READ ${vlfeat_SOURCE_DIR}/vl/host.h _lsift_host_h)
+  set(_lsift_symver [[__asm__(".symver memcpy,memcpy@GLIBC_2.2.5");]])
+  string(FIND "${_lsift_host_h}" "${_lsift_symver}" _lsift_found)
+  if(_lsift_found EQUAL -1)
+    message(FATAL_ERROR "The memcpy symbol version line was not found in vl/host.h")
+  endif()
+  string(REPLACE "${_lsift_symver}" "" _lsift_host_h "${_lsift_host_h}")
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/host.h.in "${_lsift_host_h}")
+  configure_file(${CMAKE_CURRENT_BINARY_DIR}/host.h.in ${vlfeat_code_dir}/vl/host.h COPYONLY)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${vlfeat_SOURCE_DIR}/vl/host.h)
+endif()
+
 enable_language(C)
 set(VLFEAT_SOURCES
-  ${vlfeat_SOURCE_DIR}/vl/generic.c
-  ${vlfeat_SOURCE_DIR}/vl/host.c
-  ${vlfeat_SOURCE_DIR}/vl/random.c
-  ${vlfeat_SOURCE_DIR}/vl/imopv.c
-  ${vlfeat_SOURCE_DIR}/vl/imopv_sse2.c
-  ${vlfeat_SOURCE_DIR}/vl/mathop.c
-  ${vlfeat_SOURCE_DIR}/vl/mathop_sse2.c
-  ${vlfeat_SOURCE_DIR}/vl/sift.c)
+  ${vlfeat_code_dir}/vl/generic.c
+  ${vlfeat_code_dir}/vl/host.c
+  ${vlfeat_code_dir}/vl/random.c
+  ${vlfeat_code_dir}/vl/imopv.c
+  ${vlfeat_code_dir}/vl/imopv_sse2.c
+  ${vlfeat_code_dir}/vl/mathop.c
+  ${vlfeat_code_dir}/vl/mathop_sse2.c
+  ${vlfeat_code_dir}/vl/sift.c)
 if(WIN32)
   # VLFeat initialises its global state from DllMain on Windows, so it must be a DLL.
   add_library(vlfeat SHARED ${VLFEAT_SOURCES})
@@ -33,7 +51,7 @@ else()
   add_library(vlfeat STATIC ${VLFEAT_SOURCES})
   set_target_properties(vlfeat PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
-target_include_directories(vlfeat SYSTEM PUBLIC ${vlfeat_SOURCE_DIR})
+target_include_directories(vlfeat SYSTEM PUBLIC ${vlfeat_code_dir})
 target_compile_definitions(vlfeat PUBLIC VL_DISABLE_AVX VL_DISABLE_THREADS VL_DISABLE_OPENMP)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86)$")
   # VLFeat's SSE2 code is x86 only. Elsewhere it takes the byte order from
